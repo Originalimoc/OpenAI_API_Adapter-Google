@@ -16,17 +16,25 @@ pub async fn reverse_proxy(
         return Ok(HttpResponse::NotFound().body("Not Found"));
     }
 
-	log::info!("Got request: {}", String::from_utf8_lossy(&body_data));
+    log::info!("Got request: {}", String::from_utf8_lossy(&body_data));
 
     let json_body: Value = serde_json::from_slice(&body_data)
         .map_err(|_| ErrorInternalServerError("Failed to parse JSON body"))?;
+
     let is_stream = json_body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let api_key = extract_api_key(&req)
-	    .ok_or_else(|| ErrorBadRequest("No API key provided"))?;
+        .ok_or_else(|| ErrorBadRequest("No API key provided"))?;
 
-    // Extract model name from the JSON body
     let model_name = json_body["model"].as_str()
         .ok_or_else(|| ErrorBadRequest("Model not found in request"))?;
+
+    // Transform the OpenAI request to Google's format
+    let google_body = transform_openai_to_google(&json_body, &client, &api_key).await;
+
+    let google_body_str = serde_json::to_string(&google_body)
+        .map_err(|_| ErrorInternalServerError("Failed to serialize Google body"))?;
+
+    log::info!("Converted request: {}", google_body_str);
 
     let google_base_url = data.upstream_url.clone();
     let google_url = if is_stream {
@@ -38,11 +46,7 @@ pub async fn reverse_proxy(
     let forward_req = client.post(&google_url)
         .insert_header(("Content-Type", "application/json"));
 
-    let google_body = transform_openai_to_google(&json_body);
-    let google_body_str = serde_json::to_string(&google_body)
-        .map_err(|_| ErrorInternalServerError("Failed to serialize Google body"))?;
-
-	log::info!("Converted request: {}", google_body_str);
+    log::info!("Forwarding request to: {}", google_url);
 
     match forward_req.send_body(google_body_str).await {
         Ok(mut upstream_response) => {
@@ -51,8 +55,8 @@ pub async fn reverse_proxy(
 
             for (name, value) in upstream_response.headers().iter() {
                 if name.as_str().contains("content-encoding") {
-					log::debug!("Not copied: content-encoding = {}", name.as_str());
-				} else {
+                    log::debug!("Not copied: content-encoding = {}", value.to_str().unwrap_or("PARSE HEADER VALUE ERROR"));
+                } else {
                     response.insert_header((name.clone(), value.clone()));
                 }
             }
@@ -69,12 +73,14 @@ pub async fn reverse_proxy(
                 Ok(response.streaming(up_stream))
             } else {
                 let body = upstream_response.body().await?;
-				log::info!("Got reply from Google: {}", String::from_utf8_lossy(&body));
+                log::info!("Got reply from Google: {}", String::from_utf8_lossy(&body));
 
                 let google_response: Value = serde_json::from_slice(&body)
                     .map_err(|_| ErrorInternalServerError("Failed to parse Google response"))?;
+                
+                // Transform the Google response back to OpenAI format
                 let openai_response = transform_google_to_openai(&google_response, false);
-				log::info!("Replied to client: {}", openai_response);
+                log::info!("Replied to client: {}", openai_response);
 
                 Ok(response.json(openai_response))
             }

@@ -1,5 +1,103 @@
-use actix_web::{error::ErrorInternalServerError, web::Bytes, Error};
+use actix_web::{error::*, web::Bytes, Error};
 use serde_json::{json, Value};
+use awc::Client;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+
+// Extract MIME type and decode base64 to Vec<u8>
+fn decode_base64_and_get_mime_type(encoded_data: &str) -> Result<(String, Vec<u8>), Error> {
+    // Validate the input and ensure it starts with "data:"
+    if !encoded_data.starts_with("data:") {
+        return Err(ErrorBadRequest("Invalid data URI"));
+    }
+
+    // Find the position of the first comma to separate metadata and data
+    let comma_pos = encoded_data.find(',').ok_or_else(|| ErrorBadRequest("Invalid data URI format"))?;
+
+    // Extract metadata (everything before the comma) and Base64 data (after the comma)
+    let metadata = &encoded_data[5..comma_pos];
+    let base64_data = &encoded_data[comma_pos + 1..];
+
+    // Split the metadata by ';' to retrieve the MIME type and encoding
+    let mut parts = metadata.split(';');
+    let mime_type = parts.next().ok_or_else(|| ErrorBadRequest("Missing MIME type"))?.to_string();
+    let encoding = parts.next().ok_or_else(|| ErrorBadRequest("Missing encoding"))?;
+
+    // Verify that the encoding is Base64
+    if encoding != "base64" {
+        return Err(ErrorBadRequest("Unsupported encoding format"));
+    }
+
+    // Decode the Base64 data
+    let decoded_data = STANDARD.decode(base64_data).map_err(|_| ErrorBadRequest("Failed to decode Base64 data"))?;
+
+    Ok((mime_type, decoded_data))
+}
+
+// Generic function for uploading files to Google
+async fn upload_to_google(
+    client: &Client,
+    api_key: &str,
+    metadata: Value,
+    file_data: Vec<u8>,
+    mime_type: &str,
+) -> Result<String, Error> {
+    let upload_url = format!("https://generativelanguage.googleapis.com/upload/v1beta/files?key={}", api_key);
+
+    // Initiate upload
+    let meta_response = client.post(&upload_url)
+        .insert_header(("X-Goog-Upload-Protocol", "resumable"))
+        .insert_header(("X-Goog-Upload-Command", "start"))
+        .insert_header(("X-Goog-Upload-Header-Content-Length", file_data.len().to_string()))
+        .insert_header(("X-Goog-Upload-Header-Content-Type", mime_type))
+        .insert_header(("Content-Type", "application/json"))
+        .send_body(metadata.to_string())
+        .await
+        .map_err(|_| ErrorInternalServerError("Failed to initiate upload"))?;
+
+    let upload_url = meta_response.headers()
+        .get("X-Goog-Upload-URL")
+        .and_then(|h| h.to_str().ok())
+        .ok_or(ErrorInternalServerError("Failed to get upload URL"))?;
+
+    // Upload file
+    let response = client.post(upload_url)
+        .insert_header(("Content-Length", file_data.len().to_string()))
+        .insert_header(("X-Goog-Upload-Offset", "0"))
+        .insert_header(("X-Goog-Upload-Command", "upload, finalize"))
+        .send_body(file_data)
+        .await
+        .map_err(|_| ErrorInternalServerError("Failed to upload file"))?
+        .json::<Value>()
+        .await
+        .map_err(|_| ErrorInternalServerError("Failed to parse JSON response"))?;
+
+    let file_uri = response["file"]["uri"].as_str()
+        .ok_or(ErrorInternalServerError("File URI not returned"))?;
+    Ok(file_uri.to_string())
+}
+
+// Public function to upload base64 encoded image
+pub async fn upload_base64_image_to_google(
+    client: &Client,
+    api_key: &str,
+    base64_data: &str,
+) -> Result<(String, String), Error> {
+    let (mime_type, image_data) = decode_base64_and_get_mime_type(base64_data)?;
+    let metadata = json!({"file": {"display_name": "uploaded_image"}});
+    upload_to_google(client, api_key, metadata, image_data, &mime_type).await.map(|r| (mime_type, r))
+}
+
+// Public function to upload base64 encoded audio
+pub async fn upload_base64_audio_to_google(
+    client: &Client,
+    api_key: &str,
+    base64_data: &str,
+) -> Result<(String, String), Error> {
+    let (mime_type, audio_data) = decode_base64_and_get_mime_type(base64_data)?;
+    let metadata = json!({"file": {"display_name": "uploaded_audio"}});
+    upload_to_google(client, api_key, metadata, audio_data, &mime_type).await.map(|r| (mime_type, r))
+}
 
 pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>) -> Result<Bytes, Error> {
     data.and_then(|bytes| {
@@ -86,31 +184,86 @@ pub fn transform_google_to_openai(body: &Value, stream_mode: bool) -> Value {
     openai_response
 }
 
-pub fn transform_openai_to_google(body: &Value) -> Value {
+pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: &str) -> Value {
     let empty = vec![];
     let messages = body.get("messages").and_then(Value::as_array).unwrap_or(&empty);
 
-    let contents = messages.iter().filter_map(|msg| {
+    let mut contents = Vec::new();
+    for msg in messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
         if role == "system" {
-            None
-        } else {
-            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            Some(json!({
-                "role": role,
-                "parts": [{ "text": content }]
-            }))
+            continue;
         }
-    }).collect::<Vec<_>>();
-    
-    // Extract configuration from OpenAI body if available, or use defaults
+
+        let content = msg.get("content").unwrap_or(&Value::Null);
+        let parts = match content {
+            Value::String(text) => {
+                vec![json!({ "text": text })]
+            },
+            Value::Array(content_parts) => {
+                let mut parts_vec = Vec::new();
+                for part in content_parts {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                parts_vec.push(json!({ "text": text }));
+                            }
+                        },
+                        Some("image_url") => {
+                            if let Some(image_url) = part.get("image_url") {
+                                let base64_data = image_url["url"].as_str().unwrap_or("");
+                                match upload_base64_image_to_google(client, api_key, base64_data).await {
+                                    Ok((mime, upload_url)) => {
+                                        parts_vec.push(json!({
+                                            "file_data": {
+                                                "mime_type": mime, // Adjust based on actual MIME type
+                                                "file_uri": upload_url
+                                            }
+                                        }));
+                                    },
+                                    Err(e) => {
+                                        log::error!("Error uploading image: {}", e);
+                                    }
+                                }
+                            }
+                        },
+                        Some("input_audio") => {
+                            if let Some(audio) = part.get("input_audio") {
+                                let base64_data = audio["data"].as_str().unwrap_or("");
+                                let _format = audio["format"].as_str().unwrap_or("wav");
+                                if let Ok((mime, upload_url)) = upload_base64_audio_to_google(client, api_key, base64_data).await {
+                                    parts_vec.push(json!({
+                                        "file_data": {
+                                            "mime_type": mime, // Adjust MIME type as needed
+                                            "file_uri": upload_url
+                                        }
+                                    }));
+                                } else {
+                                    log::error!("Error uploading audio");
+                                }
+                            }
+                        },
+                        _ => {
+                            // Handle unknown types or log an error
+                            log::warn!("Unknown content type in message");
+                        }
+                    }
+                }
+                parts_vec
+            },
+            _ => Vec::new(),
+        };
+
+        contents.push(json!({
+            "role": role,
+            "parts": parts
+        }));
+    }
+
     let temperature = body.get("temperature").and_then(|t| t.as_f64()).unwrap_or(1.0);
-    let _presence_penalty = body.get("presence_penalty").and_then(|p| p.as_f64()).unwrap_or(0.0);
-    let _frequency_penalty = body.get("frequency_penalty").and_then(|f| f.as_f64()).unwrap_or(0.0);
     let max_tokens = body.get("max_tokens").or_else(|| body.get("max_completion_tokens")).and_then(|m| m.as_i64()).unwrap_or(8192);
     let top_p = body.get("top_p").and_then(|p| p.as_f64()).unwrap_or(1.0);
 
-    // Extract system instruction if available
     let system_instruction = messages.iter().find(|msg| {
         msg.get("role").and_then(|r| r.as_str()) == Some("system")
     }).and_then(|system_msg| system_msg.get("content").and_then(|c| c.as_str()));
@@ -119,18 +272,15 @@ pub fn transform_openai_to_google(body: &Value) -> Value {
         "contents": contents,
         "generationConfig": {
             "temperature": temperature,
-			// Penalty currently not supported
-            // "presencePenalty": presence_penalty,
-            // "frequencyPenalty": frequency_penalty,
             "maxOutputTokens": max_tokens,
             "topP": top_p
         },
     });
-	if let Some(instruction) = system_instruction {
-		result["systemInstruction"] = json!({
-			"parts": [{"text": instruction}],
-			"role": "system"
-		})
-	};
-	result
+    if let Some(instruction) = system_instruction {
+        result["systemInstruction"] = json!({
+            "parts": [{"text": instruction}],
+            "role": "system"
+        });
+    }
+    result
 }

@@ -1,6 +1,6 @@
 [package]
 name = "google_api_openai_adaptor"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [dependencies]
@@ -16,3 +16,5 @@ clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 serde = "1"
 uuid = { version = "1", features = ["v4"] }
+regex = "1"
+base64 = "0.22"
