@@ -90,15 +90,19 @@ pub fn transform_openai_to_google(body: &Value) -> Value {
     let empty = vec![];
     let messages = body.get("messages").and_then(Value::as_array).unwrap_or(&empty);
 
-    let contents = messages.iter().map(|msg| {
+    let contents = messages.iter().filter_map(|msg| {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        json!({
-            "role": role,
-            "parts": [{ "text": content }]
-        })
+        if role == "system" {
+            None
+        } else {
+            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            Some(json!({
+                "role": role,
+                "parts": [{ "text": content }]
+            }))
+        }
     }).collect::<Vec<_>>();
-
+    
     // Extract configuration from OpenAI body if available, or use defaults
     let temperature = body.get("temperature").and_then(|t| t.as_f64()).unwrap_or(1.0);
     let _presence_penalty = body.get("presence_penalty").and_then(|p| p.as_f64()).unwrap_or(0.0);
