@@ -4,7 +4,7 @@ mod proxy;
 mod transformers;
 mod utils;
 
-use actix_web::{web, App, HttpServer};
+use actix_web::{web::{self, PayloadConfig}, App, HttpServer};
 use cli::Args;
 use clap::Parser;
 use proxy::reverse_proxy;
@@ -52,6 +52,7 @@ async fn main() -> std::io::Result<()> {
         let client = new_request_client(tls_client_config.clone());
 
         App::new()
+            .app_data(PayloadConfig::new(1 << 31))
 //            .wrap(actix_web::middleware::Compress::default())
             .app_data(web::Data::new(state.clone()))
             .app_data(web::Data::new(client))

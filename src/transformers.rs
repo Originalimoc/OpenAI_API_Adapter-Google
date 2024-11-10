@@ -213,11 +213,12 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
                             if let Some(image_url) = part.get("image_url") {
                                 let base64_data = image_url["url"].as_str().unwrap_or("");
                                 match upload_base64_image_to_google(client, api_key, base64_data).await {
-                                    Ok((mime, upload_url)) => {
+                                    Ok((mime, uploaded_uri)) => {
+                                        log::info!("image uploaded, URI: {}", uploaded_uri);
                                         parts_vec.push(json!({
                                             "file_data": {
                                                 "mime_type": mime, // Adjust based on actual MIME type
-                                                "file_uri": upload_url
+                                                "file_uri": uploaded_uri
                                             }
                                         }));
                                     },
@@ -231,11 +232,12 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
                             if let Some(audio) = part.get("input_audio") {
                                 let base64_data = audio["data"].as_str().unwrap_or("");
                                 let _format = audio["format"].as_str().unwrap_or("wav");
-                                if let Ok((mime, upload_url)) = upload_base64_audio_to_google(client, api_key, base64_data).await {
+                                if let Ok((mime, uploaded_uri)) = upload_base64_audio_to_google(client, api_key, base64_data).await {
+                                    log::info!("audio uploaded, URI: {}", uploaded_uri);
                                     parts_vec.push(json!({
                                         "file_data": {
                                             "mime_type": mime, // Adjust MIME type as needed
-                                            "file_uri": upload_url
+                                            "file_uri": uploaded_uri
                                         }
                                     }));
                                 } else {
