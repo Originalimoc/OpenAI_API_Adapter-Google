@@ -168,6 +168,7 @@ pub fn transform_google_to_openai(body: &Value, stream_mode: bool) -> Value {
                         });
                         
                         if let Some(role) = parts.first().and_then(|part| part.get("role").and_then(|r| r.as_str())) {
+                            let role = if role == "model" { "assistant" } else { role };
                             message["role"] = json!(role);
                         }
 
@@ -191,6 +192,7 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
     let mut contents = Vec::new();
     for msg in messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let role = if role == "assistant" { "model" } else { role };
         if role == "system" {
             continue;
         }
