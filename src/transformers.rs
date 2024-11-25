@@ -283,10 +283,23 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
         msg.get("role").and_then(|r| r.as_str()) == Some("system")
     }).and_then(|system_msg| system_msg.get("content").and_then(|c| c.as_str()));
 
-    let safety_settings = vec![json!({
-        "category": "HARM_CATEGORY_UNSPECIFIED",
-        "threshold": "BLOCK_NONE"
-      })];
+    let categories = [
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "HARM_CATEGORY_CIVIC_INTEGRITY",
+    ];
+
+    let safety_settings: Vec<Value> = categories
+        .iter()
+        .map(|category| {
+            json!({
+                "category": category,
+                "threshold": "BLOCK_NONE"
+            })
+        })
+        .collect();
 
     let mut result = json!({
         "contents": contents,
