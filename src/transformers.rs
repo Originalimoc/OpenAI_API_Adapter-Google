@@ -267,17 +267,38 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
     let temperature = body.get("temperature").and_then(|t| t.as_f64()).unwrap_or(1.0);
     let max_tokens = body.get("max_tokens").or_else(|| body.get("max_completion_tokens")).and_then(|m| m.as_i64()).unwrap_or(8192);
     let top_p = body.get("top_p").and_then(|p| p.as_f64()).unwrap_or(1.0);
+    let presence_penalty = body.get("presence_penalty").and_then(|p| p.as_f64()).unwrap_or(0.0);
+    let frequency_penalty = body.get("frequency_penalty").and_then(|p| p.as_f64()).unwrap_or(0.0);
+    let n_candidates = body.get("n").and_then(|m| m.as_i64()).unwrap_or(1);
+    let stop_sequences = match body.get("stop") {
+        Some(Value::Array(arr)) => arr.iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.to_string())
+            .collect::<Vec<String>>(),
+        Some(Value::String(s)) => vec![s.to_string()],
+        _ => Vec::new(),
+    };
 
     let system_instruction = messages.iter().find(|msg| {
         msg.get("role").and_then(|r| r.as_str()) == Some("system")
     }).and_then(|system_msg| system_msg.get("content").and_then(|c| c.as_str()));
 
+    let safety_settings = vec![json!({
+        "category": "HARM_CATEGORY_UNSPECIFIED",
+        "threshold": "BLOCK_NONE"
+      })];
+
     let mut result = json!({
         "contents": contents,
+        "safetySettings": safety_settings,
         "generationConfig": {
-            "temperature": temperature,
+            "stopSequences": stop_sequences,
+            "candidateCount": n_candidates,
             "maxOutputTokens": max_tokens,
-            "topP": top_p
+            "temperature": temperature,
+            "topP": top_p,
+            "presencePenalty": presence_penalty,
+            "frequencyPenalty": frequency_penalty
         },
     });
     if let Some(instruction) = system_instruction {
