@@ -48,7 +48,7 @@ pub async fn reverse_proxy(
 
     log::info!("Forwarding request to: {}", google_url);
 
-    match forward_req.send_body(google_body_str).await {
+    match forward_req.timeout(std::time::Duration::from_secs(600)).send_body(google_body_str).await {
         Ok(mut upstream_response) => {
             let status: awc::http::StatusCode = upstream_response.status();
             let mut response = HttpResponse::build(status);
