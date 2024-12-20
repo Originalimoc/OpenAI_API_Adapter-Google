@@ -161,23 +161,35 @@ pub fn transform_google_to_openai(body: &Value, stream_mode: bool) -> Value {
         for (index, candidate) in candidates.iter().enumerate() {
             if let Some(content) = candidate.get("content") {
                 if let Some(parts) = content.get("parts").and_then(Value::as_array) {
-                    if let Some(text) = parts.first().and_then(|part| part.get("text").and_then(|t| t.as_str())) {
-                        // Construct the message object dynamically
-                        let mut message = json!({
-                            "content": text
-                        });
-                        
-                        if let Some(role) = parts.first().and_then(|part| part.get("role").and_then(|r| r.as_str())) {
-                            let role = if role == "model" { "assistant" } else { role };
-                            message["role"] = json!(role);
+                    let text: Vec<String> = parts.iter().filter_map(|part| part.get("text").and_then(|p| p.as_str().map(|s| s.to_string()))).collect();
+                    log::debug!("Google::candidates::content::parts::text.len() = {}", text.len());
+                    let text = match text.len() {
+                        0 => "".to_string(),
+                        1 => text[0].clone(),
+                        2 => format!("{}\n## Answer after Thoughts\n{}", text[0], text[1]),
+                        _ => {
+                            let mut formatted_text = String::new();
+                            for (i, t) in text.iter().enumerate() {
+                                formatted_text.push_str(&format!("## Part {}\n{}\n", i + 1, t));
+                            }
+                            formatted_text
                         }
-
-                        openai_response["choices"].as_array_mut().unwrap().push(json!({
-                            message_type: message,
-                            "finish_reason": candidate.get("finishReason").and_then(|r| r.as_str()).map(|r| r.to_lowercase()),
-                            "index": index
-                        }));
+                    };
+                    // Construct the message object dynamically
+                    let mut message = json!({
+                        "content": text
+                    });
+                    
+                    if let Some(role) = parts.first().and_then(|part| part.get("role").and_then(|r| r.as_str())) {
+                        let role = if role == "model" { "assistant" } else { role };
+                        message["role"] = json!(role);
                     }
+
+                    openai_response["choices"].as_array_mut().unwrap().push(json!({
+                        message_type: message,
+                        "finish_reason": candidate.get("finishReason").and_then(|r| r.as_str()).map(|r| r.to_lowercase()),
+                        "index": index
+                    }));
                 }
             }
         }
