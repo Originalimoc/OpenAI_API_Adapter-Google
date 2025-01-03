@@ -5,6 +5,6 @@ use clap::Parser;
 pub struct Args {
     #[arg(long, value_name = "port", default_value = "18788")]
     pub port: u16,
-    #[arg(long, value_name = "upstream_url", default_value = "https://generativelanguage.googleapis.com/v1beta")]
+    #[arg(long, value_name = "upstream_url", default_value = "https://generativelanguage.googleapis.com/v1alpha")]
     pub upstream_url: String,
 }

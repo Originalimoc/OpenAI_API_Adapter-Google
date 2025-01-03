@@ -99,7 +99,7 @@ pub async fn upload_base64_audio_to_google(
     upload_to_google(client, api_key, metadata, audio_data, &mime_type).await.map(|r| (mime_type, r))
 }
 
-pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>) -> Result<Bytes, Error> {
+pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>, no_thought_process: bool) -> Result<Bytes, Error> {
     data.and_then(|bytes| {
         let input = String::from_utf8_lossy(&bytes);
         log::info!("Got streaming data: {}", input);
@@ -114,13 +114,14 @@ pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>) -> Result<B
             } else if let Some(json_str) = event.strip_prefix("data: ") {
                 match serde_json::from_str::<Value>(json_str) {
                     Ok(json) => {
-                        let openai_chunk = transform_google_to_openai(&json, true);
-                        let transformed_event = format!(
-                            "data: {}\n\n",
-                            serde_json::to_string(&openai_chunk)
-                                .map_err(|_| ErrorInternalServerError("Failed to serialize JSON"))?
-                        );
-                        output.push(transformed_event);
+                        let openai_chunk = transform_google_to_openai(&json, true, no_thought_process);
+                        if let Some(openai_chunk) = openai_chunk {
+                            let transformed_event = format!(
+                                "data: {}\n\n",
+                                serde_json::to_string(&openai_chunk).map_err(|_| ErrorInternalServerError("Failed to serialize JSON"))?
+                            );
+                            output.push(transformed_event);
+                        }
                     },
                     Err(e) => log::error!("Failed to parse JSON: {}", e),
                 }
@@ -131,18 +132,24 @@ pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>) -> Result<B
     })
 }
 
-
 // This function should be updated to match the new requirements:
-pub fn transform_google_to_openai(body: &Value, stream_mode: bool) -> Value {
+pub fn transform_google_to_openai(body: &Value, stream_mode: bool, no_thought_process: bool) -> Option<Value> {
+    let mut empty_choices = true;
     let message_type = if stream_mode { "delta" } else { "message" };
+    let converted_model_name= {
+        let mut model_name = body.get("modelVersion").cloned().unwrap_or(json!(""));
+        if no_thought_process && model_name.is_string() {
+            model_name = json!(format!("{}-no-thought-process", model_name.as_str().unwrap()));
+        }
+        model_name
+    };
     let mut openai_response = json!({
         "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().to_string().replace("-", "")),
         "object": if stream_mode { "chat.completion.chunk" } else { "chat.completion" },
         "created": body.get("created").cloned().unwrap_or(json!(0)),
-        "model": body.get("modelVersion").cloned().unwrap_or(json!("")),
+        "model": converted_model_name,
         "choices": []
     });
-
     if let Some(usage_metadata) = body.get("usageMetadata") {
         if let (Some(prompt_token_count), Some(candidates_token_count), Some(total_token_count)) = (
             usage_metadata.get("promptTokenCount"),
@@ -156,15 +163,23 @@ pub fn transform_google_to_openai(body: &Value, stream_mode: bool) -> Value {
             });
         }
     }
-
     if let Some(candidates) = body.get("candidates").and_then(Value::as_array) {
         for (index, candidate) in candidates.iter().enumerate() {
             if let Some(content) = candidate.get("content") {
                 if let Some(parts) = content.get("parts").and_then(Value::as_array) {
-                    let text: Vec<String> = parts.iter().filter_map(|part| part.get("text").and_then(|p| p.as_str().map(|s| s.to_string()))).collect();
+                    let text: Vec<String> = parts.iter().filter_map(|part| {
+                        let text = part.get("text").and_then(|p| p.as_str().map(|s| s.to_string()));
+                        if no_thought_process && part.get("thought").and_then(Value::as_bool) == Some(true) {
+                            log::info!("Thought process \"{}\" skipped.", text.unwrap_or("ERROR: THOUGHT TEXT EMPTY".to_string()));
+                            None
+                        } else {
+                            text
+                        }
+                    }).collect();
+
                     log::debug!("Google::candidates::content::parts::text.len() = {}", text.len());
                     let text = match text.len() {
-                        0 => "".to_string(),
+                        0 => continue,
                         1 => text[0].clone(),
                         2 => format!("{}\n## Answer after Thoughts\n{}", text[0], text[1]),
                         _ => {
@@ -175,6 +190,7 @@ pub fn transform_google_to_openai(body: &Value, stream_mode: bool) -> Value {
                             formatted_text
                         }
                     };
+                
                     // Construct the message object dynamically
                     let mut message = json!({
                         "content": text
@@ -190,11 +206,17 @@ pub fn transform_google_to_openai(body: &Value, stream_mode: bool) -> Value {
                         "finish_reason": candidate.get("finishReason").and_then(|r| r.as_str()).map(|r| r.to_lowercase()),
                         "index": index
                     }));
+
+                    empty_choices = false;
                 }
             }
         }
     }
-    openai_response
+    if empty_choices {
+        None
+    } else {
+        Some(openai_response)
+    }
 }
 
 pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: &str) -> Value {

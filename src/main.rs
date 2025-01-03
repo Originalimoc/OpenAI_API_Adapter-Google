@@ -23,6 +23,10 @@ async fn main() -> std::io::Result<()> {
             {
                 "content": {
                     "parts": [
+                        {
+                            "text": ". **Refine the answer for clarity and to address potential nuance:**  Acknowledge the dogs' paws specifically and then address the user's \"paws\" with a friendly and slightly humorous correction (since technically we have feet, not paws). Offer to help with anything else.",
+                            "thought": true
+                        },
                         { "text": "That's a fun question! \n\nEach dog has 4 paws, and you have 2 dogs. \n\nSo there are 4 paws x 2 dogs = **8 paws** in your house. 🐶🐾 \n" }
                     ],
                     "role": "model"
@@ -45,8 +49,8 @@ async fn main() -> std::io::Result<()> {
         "modelVersion": "gemini-1.5-flash-001",
         "created": 1653500834
     });
-    let openai_response = transformers::transform_google_to_openai(&google_input, false);
-    log::debug!("{}", openai_response);
+    let openai_response = transformers::transform_google_to_openai(&google_input, false, true);
+    log::debug!("{:?}", openai_response);
 
     HttpServer::new(move || {
         let client = new_request_client(tls_client_config.clone());

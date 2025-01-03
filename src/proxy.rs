@@ -25,8 +25,14 @@ pub async fn reverse_proxy(
     let api_key = extract_api_key(&req)
         .ok_or_else(|| ErrorBadRequest("No API key provided"))?;
 
-    let model_name = json_body["model"].as_str()
+    let model_name_in_request = json_body["model"].as_str()
         .ok_or_else(|| ErrorBadRequest("Model not found in request"))?;
+    let no_thought_process = model_name_in_request.ends_with("-no-thought-process");
+    let model_name = if no_thought_process {
+        model_name_in_request.trim_end_matches("-no-thought-process")
+    } else {
+        model_name_in_request
+    };
 
     // Transform the OpenAI request to Google's format
     let google_body = transform_openai_to_google(&json_body, &client, &api_key).await;
@@ -65,9 +71,9 @@ pub async fn reverse_proxy(
                 let up_stream = upstream_response.into_stream().map_err(|e| {
                     log::error!("Error in stream: {:?}", e);
                     ErrorInternalServerError("Error processing stream")
-                }).map(|result| {
+                }).map(move |result| {
                     result.and_then(|bytes| {
-                        transform_google_stream_to_openai(Ok(bytes))
+                        transform_google_stream_to_openai(Ok(bytes), no_thought_process)
                     })
                 });
                 Ok(response.streaming(up_stream))
@@ -79,10 +85,14 @@ pub async fn reverse_proxy(
                     .map_err(|_| ErrorInternalServerError("Failed to parse Google response"))?;
                 
                 // Transform the Google response back to OpenAI format
-                let openai_response = transform_google_to_openai(&google_response, false);
-                log::info!("Replied to client: {}", openai_response);
-
-                Ok(response.json(openai_response))
+                let openai_response = transform_google_to_openai(&google_response, false, no_thought_process);
+                if let Some(openai_response) = openai_response {
+                    log::info!("Replied to client: {}", openai_response);
+                    Ok(response.json(openai_response))
+                } else {
+                    log::error!("Non stream mode but no choices available. Replied 503 to client");
+                    Ok(HttpResponse::ServiceUnavailable().body("Failed to connect to upstream server."))
+                }
             }
         }
         Err(err) => {
