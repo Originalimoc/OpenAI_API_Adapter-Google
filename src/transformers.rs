@@ -185,12 +185,14 @@ pub fn transform_google_to_openai(body: &Value, stream_mode: bool, no_thought_pr
                     let text = match text_thought.len() {
                         0 => continue,
                         1 => {
-                            if prev_thought && !last_contains_thought {
-                                format!("\n## Answer after Thoughts\n{}", text_thought[0].0)
-                            } else if !prev_thought && last_contains_thought {
-                                format!("## Thought process\n{}", text_thought[0].0)
-                            } else {
+                            if no_thought_process {
                                 text_thought[0].0.clone()
+                            } else {
+                                match (prev_thought, last_contains_thought) {
+                                    (true, false) => format!("\n## Answer after Thoughts\n{}", text_thought[0].0),
+                                    (false, true) => format!("## Thought process\n{}", text_thought[0].0),
+                                    _ => text_thought[0].0.clone(),
+                                }
                             }
                         },
                         2 => {
