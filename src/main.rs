@@ -49,7 +49,7 @@ async fn main() -> std::io::Result<()> {
         "modelVersion": "gemini-1.5-flash-001",
         "created": 1653500834
     });
-    let openai_response = transformers::transform_google_to_openai(&google_input, false, true);
+    let openai_response = transformers::transform_google_to_openai(&google_input, false, false, true);
     log::debug!("{:?}", openai_response);
 
     HttpServer::new(move || {

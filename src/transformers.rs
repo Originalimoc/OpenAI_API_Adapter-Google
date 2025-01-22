@@ -99,22 +99,22 @@ pub async fn upload_base64_audio_to_google(
     upload_to_google(client, api_key, metadata, audio_data, &mime_type).await.map(|r| (mime_type, r))
 }
 
-pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>, no_thought_process: bool) -> Result<Bytes, Error> {
-    data.and_then(|bytes| {
+pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>, no_thought_process: bool, mut last_is_thought: bool) -> (Result<Bytes, Error>, bool) {
+    let data_r = data.and_then(|bytes| {
         let input = String::from_utf8_lossy(&bytes);
         log::info!("Got streaming data: {}", input);
 
         let events: Vec<&str> = input.split("\n\n").filter(|s| !s.is_empty()).collect();
 
         let mut output = Vec::new();
-
         for event in events {
             if event.trim() == "data: [DONE]" {
                 output.push("data: [DONE]\n\n".to_string());
             } else if let Some(json_str) = event.strip_prefix("data: ") {
                 match serde_json::from_str::<Value>(json_str) {
                     Ok(json) => {
-                        let openai_chunk = transform_google_to_openai(&json, true, no_thought_process);
+                        let (openai_chunk, contains_thought) = transform_google_to_openai(&json, true, no_thought_process, last_is_thought);
+                        last_is_thought = contains_thought;
                         if let Some(openai_chunk) = openai_chunk {
                             let transformed_event = format!(
                                 "data: {}\n\n",
@@ -129,11 +129,13 @@ pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>, no_thought_
         }
 
         Ok(Bytes::from(output.join("")))
-    })
+    });
+    (data_r, last_is_thought)
 }
 
 // This function should be updated to match the new requirements:
-pub fn transform_google_to_openai(body: &Value, stream_mode: bool, no_thought_process: bool) -> Option<Value> {
+pub fn transform_google_to_openai(body: &Value, stream_mode: bool, no_thought_process: bool, prev_thought: bool) -> (Option<Value>, bool) {
+    let mut last_contains_thought = false;
     let mut empty_choices = true;
     let message_type = if stream_mode { "delta" } else { "message" };
     let converted_model_name= {
@@ -167,25 +169,41 @@ pub fn transform_google_to_openai(body: &Value, stream_mode: bool, no_thought_pr
         for (index, candidate) in candidates.iter().enumerate() {
             if let Some(content) = candidate.get("content") {
                 if let Some(parts) = content.get("parts").and_then(Value::as_array) {
-                    let text: Vec<String> = parts.iter().filter_map(|part| {
+                    let text_thought: Vec<(String, bool)> = parts.iter().filter_map(|part| {
                         let text = part.get("text").and_then(|p| p.as_str().map(|s| s.to_string()));
-                        if no_thought_process && part.get("thought").and_then(Value::as_bool) == Some(true) {
+                        let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
+                        last_contains_thought = is_thought;
+                        if no_thought_process && is_thought {
                             log::info!("Thought process \"{}\" skipped.", text.unwrap_or("ERROR: THOUGHT TEXT EMPTY".to_string()));
                             None
                         } else {
-                            text
+                            text.map(|t| (t, is_thought))
                         }
                     }).collect();
 
-                    log::debug!("Google::candidates::content::parts::text.len() = {}", text.len());
-                    let text = match text.len() {
+                    log::debug!("Google::candidates::content::parts::text.len() = {}", text_thought.len());
+                    let text = match text_thought.len() {
                         0 => continue,
-                        1 => text[0].clone(),
-                        2 => format!("{}\n## Answer after Thoughts\n{}", text[0], text[1]),
+                        1 => {
+                            if prev_thought && !last_contains_thought {
+                                format!("\n## Answer after Thoughts\n{}", text_thought[0].0)
+                            } else if !prev_thought && last_contains_thought {
+                                format!("## Thought process\n{}", text_thought[0].0)
+                            } else {
+                                text_thought[0].0.clone()
+                            }
+                        },
+                        2 => {
+                            if text_thought[0].1 && !text_thought[1].1 {
+                                format!("{}\n## Answer after Thoughts\n{}", text_thought[0].0, text_thought[1].0)
+                            } else {
+                                format!("{}{}", text_thought[0].0, text_thought[1].0)
+                            }
+                        },
                         _ => {
                             let mut formatted_text = String::new();
-                            for (i, t) in text.iter().enumerate() {
-                                formatted_text.push_str(&format!("## Part {}\n{}\n", i + 1, t));
+                            for (i, t) in text_thought.iter().enumerate() {
+                                formatted_text.push_str(&format!("## Part {}(Thought: {})\n{}\n", i + 1, t.1, t.0));
                             }
                             formatted_text
                         }
@@ -213,13 +231,13 @@ pub fn transform_google_to_openai(body: &Value, stream_mode: bool, no_thought_pr
         }
     }
     if empty_choices {
-        None
+        (None, last_contains_thought)
     } else {
-        Some(openai_response)
+        (Some(openai_response), last_contains_thought)
     }
 }
 
-pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: &str) -> Value {
+pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: &str, thinking_enabled: bool) -> Value {
     let empty = vec![];
     let messages = body.get("messages").and_then(Value::as_array).unwrap_or(&empty);
 
@@ -335,18 +353,27 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
         })
         .collect();
 
+    let mut generation_config = json!({
+        "stopSequences": stop_sequences,
+        "candidateCount": n_candidates,
+        "maxOutputTokens": max_tokens,
+        "temperature": temperature,
+        "topP": top_p,
+        "presencePenalty": presence_penalty,
+        "frequencyPenalty": frequency_penalty
+    });
+
+    if thinking_enabled {
+        generation_config["thinkingConfig"] = json!({
+            "includeThoughts": true
+        });
+    }
+    log::debug!("thinking_enabled: {}, generation_config: {}", thinking_enabled, generation_config);
+    
     let mut result = json!({
         "contents": contents,
         "safetySettings": safety_settings,
-        "generationConfig": {
-            "stopSequences": stop_sequences,
-            "candidateCount": n_candidates,
-            "maxOutputTokens": max_tokens,
-            "temperature": temperature,
-            "topP": top_p,
-            "presencePenalty": presence_penalty,
-            "frequencyPenalty": frequency_penalty
-        },
+        "generationConfig": generation_config,
     });
     if let Some(instruction) = system_instruction {
         result["systemInstruction"] = json!({

@@ -34,8 +34,11 @@ pub async fn reverse_proxy(
         model_name_in_request
     };
 
+    let thinking_enabled_models = ["gemini-2.0-flash-thinking"];
+    let thinking_enabled = thinking_enabled_models.iter().any(|thinking_enabled_model| model_name_in_request.contains(thinking_enabled_model));
+
     // Transform the OpenAI request to Google's format
-    let google_body = transform_openai_to_google(&json_body, &client, &api_key).await;
+    let google_body = transform_openai_to_google(&json_body, &client, &api_key, thinking_enabled).await;
 
     let google_body_str = serde_json::to_string(&google_body)
         .map_err(|_| ErrorInternalServerError("Failed to serialize Google body"))?;
@@ -68,12 +71,17 @@ pub async fn reverse_proxy(
             }
 
             if upstream_response.content_type().contains("text/event-stream") {
-                let up_stream = upstream_response.into_stream().map_err(|e| {
+                let mut prev_is_thought = false;
+                let up_stream = upstream_response.into_stream()
+                .map_err(|e| {
                     log::error!("Error in stream: {:?}", e);
                     ErrorInternalServerError("Error processing stream")
-                }).map(move |result| {
+                })
+                .map(move |result| {
                     result.and_then(|bytes| {
-                        transform_google_stream_to_openai(Ok(bytes), no_thought_process)
+                        let (transformed, last_is_thought) = transform_google_stream_to_openai(Ok(bytes), no_thought_process, prev_is_thought);
+                        prev_is_thought = last_is_thought;
+                        transformed
                     })
                 });
                 Ok(response.streaming(up_stream))
@@ -85,7 +93,7 @@ pub async fn reverse_proxy(
                     .map_err(|_| ErrorInternalServerError("Failed to parse Google response"))?;
                 
                 // Transform the Google response back to OpenAI format
-                let openai_response = transform_google_to_openai(&google_response, false, no_thought_process);
+                let (openai_response, _) = transform_google_to_openai(&google_response, false, no_thought_process, false);
                 if let Some(openai_response) = openai_response {
                     log::info!("Replied to client: {}", openai_response);
                     Ok(response.json(openai_response))
