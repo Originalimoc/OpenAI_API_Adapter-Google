@@ -79,7 +79,7 @@ pub async fn reverse_proxy(
                 })
                 .map(move |result| {
                     result.and_then(|bytes| {
-                        let (transformed, last_is_thought) = transform_google_stream_to_openai(Ok(bytes), no_thought_process, prev_is_thought);
+                        let (transformed, last_is_thought) = transform_google_stream_to_openai(Ok(bytes), no_thought_process, prev_is_thought, data.markdown_thought);
                         prev_is_thought = last_is_thought;
                         transformed
                     })
@@ -93,7 +93,7 @@ pub async fn reverse_proxy(
                     .map_err(|_| ErrorInternalServerError("Failed to parse Google response"))?;
                 
                 // Transform the Google response back to OpenAI format
-                let (openai_response, _) = transform_google_to_openai(&google_response, false, no_thought_process, false);
+                let (openai_response, _) = transform_google_to_openai(&google_response, false, no_thought_process, false, data.markdown_thought);
                 if let Some(openai_response) = openai_response {
                     log::info!("Replied to client: {}", openai_response);
                     Ok(response.json(openai_response))

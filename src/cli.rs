@@ -7,4 +7,6 @@ pub struct Args {
     pub port: u16,
     #[arg(long, value_name = "upstream_url", default_value = "https://generativelanguage.googleapis.com/v1alpha")]
     pub upstream_url: String,
+    #[arg(long, value_name = "markdown_thought")]
+    pub markdown_thought: bool,
 }

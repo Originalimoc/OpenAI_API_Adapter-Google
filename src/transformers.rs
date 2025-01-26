@@ -99,7 +99,7 @@ pub async fn upload_base64_audio_to_google(
     upload_to_google(client, api_key, metadata, audio_data, &mime_type).await.map(|r| (mime_type, r))
 }
 
-pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>, no_thought_process: bool, mut last_is_thought: bool) -> (Result<Bytes, Error>, bool) {
+pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>, no_thought_process: bool, mut last_is_thought: bool, md_thought: bool) -> (Result<Bytes, Error>, bool) {
     let data_r = data.and_then(|bytes| {
         let input = String::from_utf8_lossy(&bytes);
         log::info!("Got streaming data: {}", input);
@@ -113,7 +113,7 @@ pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>, no_thought_
             } else if let Some(json_str) = event.strip_prefix("data: ") {
                 match serde_json::from_str::<Value>(json_str) {
                     Ok(json) => {
-                        let (openai_chunk, contains_thought) = transform_google_to_openai(&json, true, no_thought_process, last_is_thought);
+                        let (openai_chunk, contains_thought) = transform_google_to_openai(&json, true, no_thought_process, last_is_thought, md_thought);
                         last_is_thought = contains_thought;
                         if let Some(openai_chunk) = openai_chunk {
                             let transformed_event = format!(
@@ -134,7 +134,7 @@ pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>, no_thought_
 }
 
 // This function should be updated to match the new requirements:
-pub fn transform_google_to_openai(body: &Value, stream_mode: bool, no_thought_process: bool, prev_thought: bool) -> (Option<Value>, bool) {
+pub fn transform_google_to_openai(body: &Value, stream_mode: bool, no_thought_process: bool, prev_thought: bool, md_thought: bool) -> (Option<Value>, bool) {
     let mut last_contains_thought = false;
     let mut empty_choices = true;
     let message_type = if stream_mode { "delta" } else { "message" };
@@ -182,6 +182,16 @@ pub fn transform_google_to_openai(body: &Value, stream_mode: bool, no_thought_pr
                     }).collect();
 
                     log::debug!("Google::candidates::content::parts::text.len() = {}", text_thought.len());
+                    let thought_start_str = if md_thought {
+                        "## Thought process"
+                    } else {
+                        "<think>"
+                    };
+                    let thought_end_str = if md_thought {
+                        "## Answer after Thoughts"
+                    } else {
+                        "</think>"
+                    };
                     let text = match text_thought.len() {
                         0 => continue,
                         1 => {
@@ -189,15 +199,15 @@ pub fn transform_google_to_openai(body: &Value, stream_mode: bool, no_thought_pr
                                 text_thought[0].0.clone()
                             } else {
                                 match (prev_thought, last_contains_thought) {
-                                    (true, false) => format!("\n## Answer after Thoughts\n{}", text_thought[0].0),
-                                    (false, true) => format!("## Thought process\n{}", text_thought[0].0),
+                                    (true, false) => format!("\n{}\n{}", thought_end_str, text_thought[0].0),
+                                    (false, true) => format!("{}\n{}", thought_start_str, text_thought[0].0),
                                     _ => text_thought[0].0.clone(),
                                 }
                             }
                         },
                         2 => {
                             if text_thought[0].1 && !text_thought[1].1 {
-                                format!("{}\n## Answer after Thoughts\n{}", text_thought[0].0, text_thought[1].0)
+                                format!("{}\n{}\n{}", text_thought[0].0, thought_end_str, text_thought[1].0)
                             } else {
                                 format!("{}{}", text_thought[0].0, text_thought[1].0)
                             }

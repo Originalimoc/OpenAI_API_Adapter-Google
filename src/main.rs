@@ -14,7 +14,7 @@ use utils::{new_request_client, tls_config};
 async fn main() -> std::io::Result<()> {
     env_logger::init();
     let args = Args::parse();
-    let state = app_state::AppState::new(args.upstream_url);
+    let state = app_state::AppState::new(args.upstream_url, args.markdown_thought);
     let tls_client_config = std::sync::Arc::new(tls_config());
 
     // Test
@@ -49,7 +49,7 @@ async fn main() -> std::io::Result<()> {
         "modelVersion": "gemini-1.5-flash-001",
         "created": 1653500834
     });
-    let openai_response = transformers::transform_google_to_openai(&google_input, false, false, true);
+    let openai_response = transformers::transform_google_to_openai(&google_input, false, false, true, false);
     log::debug!("{:?}", openai_response);
 
     HttpServer::new(move || {
