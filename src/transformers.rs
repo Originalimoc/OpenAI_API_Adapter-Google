@@ -249,7 +249,7 @@ pub fn transform_google_to_openai(body: &Value, stream_mode: bool, no_thought_pr
     }
 }
 
-pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: &str, thinking_enabled: bool) -> Value {
+pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: &str, thinking_config: &ThinkingConfig) -> Value {
     let empty = vec![];
     let messages = body.get("messages").and_then(Value::as_array).unwrap_or(&empty);
 
@@ -375,12 +375,19 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
         "frequencyPenalty": frequency_penalty
     });
 
-    if thinking_enabled {
-        generation_config["thinkingConfig"] = json!({
-            "includeThoughts": true
-        });
+    if thinking_config.enabled {
+        generation_config["thinkingConfig"] = if let Some(budget) = {
+            json!({
+                "includeThoughts": true,
+                "thinkingBudget": budget
+            })
+        } else {
+            json!({
+                "includeThoughts": true
+            })
+        };
     }
-    log::debug!("thinking_enabled: {}, generation_config: {}", thinking_enabled, generation_config);
+    log::debug!("thinking_enabled: {}, thinking_budget: {}, generation_config: {}", thinking_config.enabled, thinking_config.budget, generation_config);
     
     let mut result = json!({
         "contents": contents,

@@ -6,6 +6,11 @@ use awc::Client;
 use futures_util::stream::{StreamExt, TryStreamExt};
 use serde_json::Value;
 
+pub struct ThinkingConfig {
+    enabled: bool,
+    budget: Option<u64>,
+}
+
 pub async fn reverse_proxy(
     req: HttpRequest,
     body_data: web::Bytes,
@@ -36,9 +41,22 @@ pub async fn reverse_proxy(
 
     let thinking_enabled_models = ["gemini-2.0-flash-thinking", "gemini-2.5"];
     let thinking_enabled = thinking_enabled_models.iter().any(|thinking_enabled_model| model_name_in_request.contains(thinking_enabled_model));
+    let thinking_budget_in_request: Option<u64> = json_body
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .and_then(|s| match s {
+            "low" => Some(1_000),
+            "medium" => Some(8_000),
+            "high" => Some(24_000),
+            _ => None,
+        });
+    let thinking_config = ThinkingConfig {
+        enabled: thinking_enabled,
+        budget: thinking_budget_in_request,
+    };
 
     // Transform the OpenAI request to Google's format
-    let google_body = transform_openai_to_google(&json_body, &client, &api_key, thinking_enabled).await;
+    let google_body = transform_openai_to_google(&json_body, &client, &api_key, thinking_config).await;
 
     let google_body_str = serde_json::to_string(&google_body)
         .map_err(|_| ErrorInternalServerError("Failed to serialize Google body"))?;
