@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use awc::Client;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use crate::proxy::ThinkingConfig;
 
 // Extract MIME type and decode base64 to Vec<u8>
 fn decode_base64_and_get_mime_type(encoded_data: &str) -> Result<(String, Vec<u8>), Error> {
@@ -376,7 +377,7 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
     });
 
     if thinking_config.enabled {
-        generation_config["thinkingConfig"] = if let Some(budget) = {
+        generation_config["thinkingConfig"] = if let Some(budget) = thinking_config.budget {
             json!({
                 "includeThoughts": true,
                 "thinkingBudget": budget
@@ -387,7 +388,7 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
             })
         };
     }
-    log::debug!("thinking_enabled: {}, thinking_budget: {}, generation_config: {}", thinking_config.enabled, thinking_config.budget, generation_config);
+    log::debug!("thinking_enabled: {}, thinking_budget: {:?}, generation_config: {}", thinking_config.enabled, thinking_config.budget, generation_config);
     
     let mut result = json!({
         "contents": contents,

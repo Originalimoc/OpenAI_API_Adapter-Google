@@ -7,8 +7,8 @@ use futures_util::stream::{StreamExt, TryStreamExt};
 use serde_json::Value;
 
 pub struct ThinkingConfig {
-    enabled: bool,
-    budget: Option<u64>,
+    pub enabled: bool,
+    pub budget: Option<u64>,
 }
 
 pub async fn reverse_proxy(
@@ -56,7 +56,7 @@ pub async fn reverse_proxy(
     };
 
     // Transform the OpenAI request to Google's format
-    let google_body = transform_openai_to_google(&json_body, &client, &api_key, thinking_config).await;
+    let google_body = transform_openai_to_google(&json_body, &client, &api_key, &thinking_config).await;
 
     let google_body_str = serde_json::to_string(&google_body)
         .map_err(|_| ErrorInternalServerError("Failed to serialize Google body"))?;
