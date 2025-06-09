@@ -34,7 +34,7 @@ pub async fn reverse_proxy(
         model_name_in_request
     };
 
-    let thinking_enabled_models = ["gemini-2.0-flash-thinking"];
+    let thinking_enabled_models = ["gemini-2.0-flash-thinking", "gemini-2.5"];
     let thinking_enabled = thinking_enabled_models.iter().any(|thinking_enabled_model| model_name_in_request.contains(thinking_enabled_model));
 
     // Transform the OpenAI request to Google's format

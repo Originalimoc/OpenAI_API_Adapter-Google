@@ -10,6 +10,7 @@ pub fn tls_config() -> ClientConfig {
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_platform_verifier()
+        .unwrap()
         .with_no_client_auth();
     cc.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     log::debug!("TLS configuration created");
