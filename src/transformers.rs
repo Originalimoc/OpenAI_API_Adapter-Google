@@ -43,7 +43,7 @@ async fn upload_to_google(
     file_data: Vec<u8>,
     mime_type: &str,
 ) -> Result<String, Error> {
-    let upload_url = format!("https://generativelanguage.googleapis.com/upload/v1beta/files?key={}", api_key);
+    let upload_url = format!("https://generativelanguage.googleapis.com/upload/v1beta/files?key={api_key}");
 
     // Initiate upload
     let meta_response = client.post(&upload_url)
@@ -103,7 +103,7 @@ pub async fn upload_base64_audio_to_google(
 pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>, no_thought_process: bool, mut last_is_thought: bool, md_thought: bool) -> (Result<Bytes, Error>, bool) {
     let data_r = data.and_then(|bytes| {
         let input = String::from_utf8_lossy(&bytes);
-        log::info!("Got streaming data: {}", input);
+        log::info!("Got streaming data: {input}");
 
         let events: Vec<&str> = input.split("\n\n").filter(|s| !s.is_empty()).collect();
 
@@ -124,7 +124,7 @@ pub fn transform_google_stream_to_openai(data: Result<Bytes, Error>, no_thought_
                             output.push(transformed_event);
                         }
                     },
-                    Err(e) => log::error!("Failed to parse JSON: {}", e),
+                    Err(e) => log::error!("Failed to parse JSON: {e}"),
                 }
             }
         }
@@ -281,7 +281,7 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
                                 let base64_data = image_url["url"].as_str().unwrap_or("");
                                 match upload_base64_image_to_google(client, api_key, base64_data).await {
                                     Ok((mime, uploaded_uri)) => {
-                                        log::info!("image uploaded, URI: {}", uploaded_uri);
+                                        log::info!("image uploaded, URI: {uploaded_uri}");
                                         parts_vec.push(json!({
                                             "file_data": {
                                                 "mime_type": mime, // Adjust based on actual MIME type
@@ -290,7 +290,7 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
                                         }));
                                     },
                                     Err(e) => {
-                                        log::error!("Error uploading image: {}", e);
+                                        log::error!("Error uploading image: {e}");
                                     }
                                 }
                             }
@@ -300,7 +300,7 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
                                 let base64_data = audio["data"].as_str().unwrap_or("");
                                 let _format = audio["format"].as_str().unwrap_or("wav");
                                 if let Ok((mime, uploaded_uri)) = upload_base64_audio_to_google(client, api_key, base64_data).await {
-                                    log::info!("audio uploaded, URI: {}", uploaded_uri);
+                                    log::info!("audio uploaded, URI: {uploaded_uri}");
                                     parts_vec.push(json!({
                                         "file_data": {
                                             "mime_type": mime, // Adjust MIME type as needed

@@ -61,19 +61,19 @@ pub async fn reverse_proxy(
     let google_body_str = serde_json::to_string(&google_body)
         .map_err(|_| ErrorInternalServerError("Failed to serialize Google body"))?;
 
-    log::info!("Converted request: {}", google_body_str);
+    log::info!("Converted request: {google_body_str}");
 
     let google_base_url = data.upstream_url.clone();
     let google_url = if is_stream {
-        format!("{}/models/{}:streamGenerateContent?alt=sse&key={}", google_base_url, model_name, api_key)
+        format!("{google_base_url}/models/{model_name}:streamGenerateContent?alt=sse&key={api_key}")
     } else {
-        format!("{}/models/{}:generateContent?key={}", google_base_url, model_name, api_key)
+        format!("{google_base_url}/models/{model_name}:generateContent?key={api_key}")
     };
 
     let forward_req = client.post(&google_url)
         .insert_header(("Content-Type", "application/json"));
 
-    log::info!("Forwarding request to: {}", google_url);
+    log::info!("Forwarding request to: {google_url}");
 
     match forward_req.timeout(std::time::Duration::from_secs(600)).send_body(google_body_str).await {
         Ok(mut upstream_response) => {
@@ -92,7 +92,7 @@ pub async fn reverse_proxy(
                 let mut prev_is_thought = false;
                 let up_stream = upstream_response.into_stream()
                 .map_err(|e| {
-                    log::error!("Error in stream: {:?}", e);
+                    log::error!("Error in stream: {e:?}");
                     ErrorInternalServerError("Error processing stream")
                 })
                 .map(move |result| {
@@ -113,7 +113,7 @@ pub async fn reverse_proxy(
                 // Transform the Google response back to OpenAI format
                 let (openai_response, _) = transform_google_to_openai(&google_response, false, no_thought_process, false, data.markdown_thought);
                 if let Some(openai_response) = openai_response {
-                    log::info!("Replied to client: {}", openai_response);
+                    log::info!("Replied to client: {openai_response}");
                     Ok(response.json(openai_response))
                 } else {
                     log::error!("Non stream mode but no choices available. Replied 503 to client");
@@ -122,7 +122,7 @@ pub async fn reverse_proxy(
             }
         }
         Err(err) => {
-            log::error!("Failed to forward request: {:?}", err);
+            log::error!("Failed to forward request: {err:?}");
             Ok(HttpResponse::InternalServerError().body("Failed to connect to upstream server."))
         }
     }

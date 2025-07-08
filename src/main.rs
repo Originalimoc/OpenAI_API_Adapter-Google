@@ -50,7 +50,7 @@ async fn main() -> std::io::Result<()> {
         "created": 1653500834
     });
     let openai_response = transformers::transform_google_to_openai(&google_input, false, false, true, false);
-    log::debug!("{:?}", openai_response);
+    log::debug!("{openai_response:?}");
 
     HttpServer::new(move || {
         let client = new_request_client(tls_client_config.clone());
