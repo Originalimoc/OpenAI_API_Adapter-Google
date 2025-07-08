@@ -6,9 +6,10 @@ use awc::Client;
 use futures_util::stream::{StreamExt, TryStreamExt};
 use serde_json::Value;
 
+/// Thinking will be enabled by name if matched by thinking_enabled_models
 pub struct ThinkingConfig {
     pub enabled: bool,
-    pub budget: Option<u64>,
+    pub budget: Option<i64>,
 }
 
 pub async fn reverse_proxy(
@@ -40,15 +41,29 @@ pub async fn reverse_proxy(
     };
 
     let thinking_enabled_models = ["gemini-2.0-flash-thinking", "gemini-2.5"];
+    let mut must_think_models = std::collections::HashMap::new();
+    must_think_models.insert("gemini-2.5-pro", 128); // 128 is minimal settable
     let thinking_enabled = thinking_enabled_models.iter().any(|thinking_enabled_model| model_name_in_request.contains(thinking_enabled_model));
-    let thinking_budget_in_request: Option<u64> = json_body
+    let thinking_budget_in_request: Option<i64> = json_body
         .get("reasoning_effort")
         .and_then(|v| v.as_str())
-        .and_then(|s| match s {
-            "low" => Some(1_000),
-            "medium" => Some(8_000),
-            "high" => Some(24_000),
-            _ => None,
+        .map(|s| match s {
+            "low" => 1_024,
+            "medium" => 8_192,
+            "high" => 24_576,
+            "none" => {
+                let found_min_budget = must_think_models
+                    .iter()
+                    .find_map(|(must_think_model_base_name, &min_budget)| {
+                        if model_name_in_request.contains(must_think_model_base_name) {
+                            Some(min_budget as i64)
+                        } else {
+                            None
+                        }
+                    });
+                found_min_budget.unwrap_or(0)
+            },
+            _ => 1024, // Value set but not supported mode, assuming a low effort
         });
     let thinking_config = ThinkingConfig {
         enabled: thinking_enabled,

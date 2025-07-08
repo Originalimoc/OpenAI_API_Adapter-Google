@@ -384,7 +384,8 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
             })
         } else {
             json!({
-                "includeThoughts": true
+                "includeThoughts": true,
+                "thinkingBudget": -1 // Overwrite 2.5 Flash Lite Default setting to dynamic thinking too
             })
         };
     }

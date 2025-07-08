@@ -56,8 +56,8 @@ async fn main() -> std::io::Result<()> {
         let client = new_request_client(tls_client_config.clone());
 
         App::new()
-            .app_data(PayloadConfig::new(1 << 31))
-//            .wrap(actix_web::middleware::Compress::default())
+            .app_data(PayloadConfig::new(1 << 31)) // for loading big pic
+//          .wrap(actix_web::middleware::Compress::default()) // breaks streaming
             .app_data(web::Data::new(state.clone()))
             .app_data(web::Data::new(client))
             .route("/{path:.*}", web::to(reverse_proxy))
