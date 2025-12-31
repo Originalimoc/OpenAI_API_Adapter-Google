@@ -397,9 +397,8 @@ pub async fn transform_openai_to_google(body: &Value, client: &Client, api_key: 
         "generationConfig": generation_config,
     });
     if let Some(instruction) = system_instruction {
-        result["systemInstruction"] = json!({
+        result["system_instruction"] = json!({
             "parts": [{"text": instruction}],
-            "role": "system"
         });
     }
     result

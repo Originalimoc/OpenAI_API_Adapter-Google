@@ -40,7 +40,7 @@ pub async fn reverse_proxy(
         model_name_in_request
     };
 
-    let thinking_enabled_models = ["gemini-2.0-flash-thinking", "gemini-2.5"];
+    let thinking_enabled_models = ["gemini-2.0-flash-thinking", "gemini-2.5", "gemini-3"];
     let mut must_think_models = std::collections::HashMap::new();
     must_think_models.insert("gemini-2.5-pro", 128); // 128 is minimal settable
     let thinking_enabled = thinking_enabled_models.iter().any(|thinking_enabled_model| model_name_in_request.contains(thinking_enabled_model));
@@ -63,7 +63,7 @@ pub async fn reverse_proxy(
                     });
                 found_min_budget.unwrap_or(0)
             },
-            _ => 1024, // Value set but not supported mode, assuming a low effort
+            _ => 24_576, // Value set but not supported mode, assuming a high effort
         });
     let thinking_config = ThinkingConfig {
         enabled: thinking_enabled,
