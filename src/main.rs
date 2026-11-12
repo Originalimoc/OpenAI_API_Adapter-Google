@@ -17,7 +17,12 @@ use utils::{new_request_client, tls_config};
 async fn main() -> std::io::Result<()> {
     env_logger::init();
     let args = Args::parse();
-    let state = app_state::AppState::new(args.upstream_url, args.markdown_thought);
+    let state = app_state::AppState::new(
+        args.upstream_url,
+        args.markdown_thought,
+        args.port,
+        args.cache_id,
+    );
     let tls_client_config = std::sync::Arc::new(tls_config());
 
     // Startup self-test

@@ -1466,6 +1466,10 @@ pub async fn transform_openai_to_google(
     model_name: &str,
     app_state: Option<&AppState>,
 ) -> Value {
+    if let Some(st) = app_state {
+        st.sync_all_from_disk();
+    }
+
     let empty = vec![];
     let messages = body
         .get("messages")
