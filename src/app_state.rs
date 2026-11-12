@@ -46,6 +46,8 @@ pub struct CacheStore {
 pub struct AppState {
     pub upstream_url: String,
     pub markdown_thought: bool,
+    pub include_thoughts: bool,
+    pub default_reasoning_effort: String,
     pub store: Arc<Mutex<CacheStore>>,
     pub own_cache_path: PathBuf,
     pub cache_dir: PathBuf,
@@ -103,6 +105,8 @@ impl AppState {
     pub fn new(
         upstream_url: String,
         markdown_thought: bool,
+        include_thoughts: bool,
+        default_reasoning_effort: String,
         port: u16,
         cache_id: Option<String>,
     ) -> Self {
@@ -125,14 +129,18 @@ impl AppState {
         let own_cache_path = cache_dir.join(format!("{CACHE_FILE_PREFIX}_{instance_tag}.json"));
 
         log::info!(
-            "Cache initialized: writing to {:?}, reading all {:?}/{CACHE_FILE_PREFIX}*.json",
+            "Cache initialized: writing to {:?}, reading all {:?}/{CACHE_FILE_PREFIX}*.json (include_thoughts={}, default_reasoning_effort={})",
             own_cache_path,
-            cache_dir
+            cache_dir,
+            include_thoughts,
+            default_reasoning_effort
         );
 
         let state = Self {
             upstream_url,
             markdown_thought,
+            include_thoughts,
+            default_reasoning_effort,
             store: Arc::new(Mutex::new(CacheStore::default())),
             own_cache_path,
             cache_dir,

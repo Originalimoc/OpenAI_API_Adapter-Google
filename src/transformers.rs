@@ -1952,18 +1952,21 @@ pub async fn transform_openai_to_google(
     }
 
     if thinking_config.enabled {
-        generation_config["thinkingConfig"] = if let Some(budget) = thinking_config.budget {
-            json!({
-                "includeThoughts": true,
-                "thinkingBudget": budget
-            })
-        } else {
-            json!({
-                "includeThoughts": true,
-                "thinkingBudget": -1
-            })
-        };
+        let mut tc = json!({
+            "includeThoughts": thinking_config.include_thoughts
+        });
+        if let Some(ref level) = thinking_config.thinking_level {
+            tc["thinkingLevel"] = json!(level);
+        } else if let Some(budget) = thinking_config.budget {
+            tc["thinkingBudget"] = json!(budget);
+        }
+        generation_config["thinkingConfig"] = tc;
     }
+    log::debug!(
+        "Model: {}, thinkingConfig: {:?}",
+        model_name,
+        generation_config.get("thinkingConfig")
+    );
 
     let mut result = json!({
         "contents": contents,

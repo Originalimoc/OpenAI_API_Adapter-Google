@@ -19,9 +19,112 @@ use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Thinking will be enabled by name if matched by thinking_enabled_models
+/// Represents the resolved `generationConfig.thinkingConfig` for Gemini 2.5 (`thinkingBudget`)
+/// and Gemini 3 / Gemini 4 (`thinkingLevel`).
+#[derive(Debug, Clone)]
 pub struct ThinkingConfig {
     pub enabled: bool,
+    pub include_thoughts: bool,
+    /// Used for Gemini 3 and Gemini 4 models (`"MINIMAL" | "LOW" | "MEDIUM" | "HIGH"`).
+    pub thinking_level: Option<String>,
+    /// Used for Gemini 2.0 / 2.5 models (e.g. `24576` for high, `8192` for medium, `1024` for low, `-1` for dynamic).
     pub budget: Option<i64>,
+}
+
+fn build_thinking_config(
+    model_name: &str,
+    no_thought_process: bool,
+    request_effort: Option<&str>,
+    default_effort: &str,
+    cli_include_thoughts: bool,
+) -> ThinkingConfig {
+    let lower_model = model_name.to_ascii_lowercase();
+
+    // Models that reject `thinkingConfig` with 400 INVALID_ARGUMENT
+    let rejects_thinking = lower_model.contains("-tts")
+        || lower_model.contains("-image")
+        || lower_model.contains("banana")
+        || lower_model.contains("-transcribe")
+        || lower_model.starts_with("imagen-")
+        || lower_model.starts_with("veo-");
+
+    let is_gemini_3 = lower_model.contains("gemini-3");
+    let is_gemini_4 = lower_model.contains("gemini-4");
+    let is_gemini_2_5 =
+        lower_model.contains("gemini-2.5") || lower_model.contains("gemini-2.0-flash-thinking");
+
+    if rejects_thinking || !(is_gemini_3 || is_gemini_4 || is_gemini_2_5) {
+        return ThinkingConfig {
+            enabled: false,
+            include_thoughts: false,
+            thinking_level: None,
+            budget: None,
+        };
+    }
+
+    let effort = request_effort
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_effort)
+        .to_ascii_lowercase();
+
+    let include_thoughts = cli_include_thoughts && !no_thought_process;
+
+    // Gemini 3 and Gemini 4 use official `thinkingLevel` (thinkingBudget is deprecated/rejected)
+    if is_gemini_3 || is_gemini_4 {
+        let level: Option<&str> = match effort.as_str() {
+            "high" | "xhigh" | "max" => Some("HIGH"),
+            "medium" | "med" => {
+                // `gemini-3-pro` (non-3.1) only supports LOW and HIGH; promote medium -> HIGH
+                if lower_model.starts_with("gemini-3-pro") {
+                    Some("HIGH")
+                } else {
+                    Some("MEDIUM")
+                }
+            }
+            "low" => Some("LOW"),
+            "minimal" | "min" | "none" | "off" | "disable" => {
+                // Gemini 4 does not support MINIMAL (minimum supported tier is LOW)
+                if is_gemini_4 || lower_model.contains("-pro") {
+                    Some("LOW")
+                } else {
+                    Some("MINIMAL")
+                }
+            }
+            "dynamic" | "auto" => None, // Omit thinkingLevel to let Gemini use dynamic default
+            _ => Some("HIGH"),          // Default to official HIGH level
+        };
+
+        return ThinkingConfig {
+            enabled: true,
+            include_thoughts,
+            thinking_level: level.map(|s| s.to_string()),
+            budget: None,
+        };
+    }
+
+    // Gemini 2.5 / 2.0-flash-thinking uses `thinkingBudget`
+    let budget: Option<i64> = match effort.as_str() {
+        "high" | "xhigh" | "max" => Some(24_576),
+        "medium" | "med" => Some(8_192),
+        "low" => Some(1_024),
+        "minimal" | "min" | "none" | "off" | "disable" => {
+            if lower_model.contains("gemini-2.5-pro") {
+                Some(128) // 128 is minimum settable budget on 2.5 Pro
+            } else {
+                Some(0)
+            }
+        }
+        "dynamic" | "auto" => Some(-1),
+        _ => Some(24_576),
+    };
+
+    ThinkingConfig {
+        enabled: true,
+        include_thoughts,
+        thinking_level: None,
+        budget,
+    }
 }
 
 pub async fn reverse_proxy(
@@ -71,51 +174,21 @@ pub async fn reverse_proxy(
             .await;
     }
 
-    let thinking_enabled_models = [
-        "gemini-2.0-flash-thinking",
-        "gemini-2.5",
-        "gemini-3",
-        "gemini-4",
-    ];
-    let mut must_think_models = std::collections::HashMap::new();
-    must_think_models.insert("gemini-2.5-pro", 128);
-    must_think_models.insert("gemini-4-argon", 512);
-
-    let is_tts_or_image_model =
-        model_name.contains("-tts") || model_name.contains("-image") || model_name.contains("banana");
-
-    let thinking_enabled = !is_tts_or_image_model
-        && thinking_enabled_models
-            .iter()
-            .any(|m| model_name_in_request.contains(m));
-
-    let thinking_budget_in_request: Option<i64> = json_body
+    // Check incoming OpenAI `reasoning_effort` or `reasoning.effort`
+    let request_reasoning_effort = json_body
         .get("reasoning_effort")
         .and_then(|v| v.as_str())
-        .map(|s| match s {
-            "low" => 1_024,
-            "medium" => 8_192,
-            "high" => 24_576,
-            "none" => {
-                let found_min_budget =
-                    must_think_models
-                        .iter()
-                        .find_map(|(must_think_model_base_name, &min_budget)| {
-                            if model_name_in_request.contains(must_think_model_base_name) {
-                                Some(min_budget as i64)
-                            } else {
-                                None
-                            }
-                        });
-                found_min_budget.unwrap_or(0)
-            }
-            _ => 24_576,
-        });
+        .or_else(|| json_body.pointer("/reasoning/effort").and_then(|v| v.as_str()));
 
-    let thinking_config = ThinkingConfig {
-        enabled: thinking_enabled,
-        budget: thinking_budget_in_request,
-    };
+    let thinking_config = build_thinking_config(
+        model_name,
+        no_thought_process,
+        request_reasoning_effort,
+        &data.default_reasoning_effort,
+        data.include_thoughts,
+    );
+
+    let effective_hide_thoughts = no_thought_process || !data.include_thoughts;
 
     let google_body = transform_openai_to_google(
         &json_body,
@@ -173,7 +246,7 @@ pub async fn reverse_proxy(
                 let up_stream = async_stream_from_upstream(
                     upstream_response,
                     requested_model,
-                    no_thought_process,
+                    effective_hide_thoughts,
                     md_thought,
                     state_clone,
                 );
@@ -205,7 +278,7 @@ pub async fn reverse_proxy(
                 let (openai_response, _) = transform_google_to_openai(
                     &google_response,
                     false,
-                    no_thought_process,
+                    effective_hide_thoughts,
                     false,
                     data.markdown_thought,
                     Some(data.get_ref()),

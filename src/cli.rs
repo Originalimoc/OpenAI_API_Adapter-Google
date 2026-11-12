@@ -15,4 +15,17 @@ pub struct Args {
     pub markdown_thought: bool,
     #[arg(long, value_name = "cache_id")]
     pub cache_id: Option<String>,
+    /// Enable returning thought summaries (`includeThoughts: true`) by default.
+    /// Pass `--include-thoughts=false` to disable.
+    #[arg(
+        long,
+        value_name = "bool",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub include_thoughts: bool,
+    /// Default reasoning effort when the incoming OpenAI request omits `reasoning_effort`.
+    /// Values: high (default), medium, low, minimal, none, dynamic
+    #[arg(long, value_name = "effort", default_value = "high")]
+    pub default_reasoning_effort: String,
 }

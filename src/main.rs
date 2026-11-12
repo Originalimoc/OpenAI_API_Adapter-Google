@@ -20,6 +20,8 @@ async fn main() -> std::io::Result<()> {
     let state = app_state::AppState::new(
         args.upstream_url,
         args.markdown_thought,
+        args.include_thoughts,
+        args.default_reasoning_effort,
         args.port,
         args.cache_id,
     );
