@@ -336,7 +336,10 @@ where
                         }
                     }
 
-                    final_out.push_str(&finalize_google_sse_stream(&mut st.tx_state));
+                    final_out.push_str(&finalize_google_sse_stream(
+                        &mut st.tx_state,
+                        Some(&st.app_state),
+                    ));
                     return Some((Ok(Bytes::from(final_out)), st));
                 }
             }
