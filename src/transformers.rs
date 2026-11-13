@@ -1492,11 +1492,12 @@ pub async fn transform_openai_to_google(
 
     let mut system_parts: Vec<Value> = Vec::new();
     let mut contents: Vec<Value> = Vec::new();
+    let mut seen_non_system = false;
 
     for (msg_idx, msg) in messages.iter().enumerate() {
         let raw_role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
 
-        if (raw_role == "system" || raw_role == "developer") && msg_idx == 0 {
+        if (raw_role == "system" || raw_role == "developer") && !seen_non_system {
             if let Some(text) = msg.get("content").and_then(Value::as_str) {
                 if !text.is_empty() {
                     system_parts.push(json!({ "text": text }));
@@ -1504,12 +1505,15 @@ pub async fn transform_openai_to_google(
             } else if let Some(arr) = msg.get("content").and_then(Value::as_array) {
                 for p in arr {
                     if let Some(t) = p.get("text").and_then(Value::as_str) {
-                        system_parts.push(json!({ "text": t }));
+                        if !t.is_empty() {
+                            system_parts.push(json!({ "text": t }));
+                        }
                     }
                 }
             }
             continue;
         }
+        seen_non_system = true;
 
         if raw_role == "tool" || raw_role == "function" {
             let tool_call_id = msg
@@ -1975,7 +1979,7 @@ pub async fn transform_openai_to_google(
     });
 
     if !system_parts.is_empty() {
-        result["system_instruction"] = json!({
+        result["systemInstruction"] = json!({
             "parts": system_parts,
         });
     }
