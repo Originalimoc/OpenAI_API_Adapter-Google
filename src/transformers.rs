@@ -106,6 +106,57 @@ fn decode_base64_and_get_mime_type(encoded_data: &str) -> Result<(String, Vec<u8
     Ok((mime_type, decoded_data))
 }
 
+/// Proactively strips unsupported `generationConfig` fields for models that reject them with 400 INVALID_ARGUMENT.
+pub fn apply_generation_config_ignore_filter(generation_config: &mut Value, model_name: &str) {
+    let Some(cfg) = generation_config.as_object_mut() else {
+        return;
+    };
+
+    let lower = model_name.to_ascii_lowercase();
+
+    let is_gemini_3_or_4 = lower.contains("gemini-3") || lower.contains("gemini-4");
+    let is_thinking_model = lower.contains("thinking");
+    let is_image_model = lower.contains("-image") || lower.contains("banana");
+    let is_tts_model = lower.contains("-tts");
+    let is_transcribe_model = lower.contains("-transcribe");
+    let is_gemma_or_learnlm = lower.contains("gemma") || lower.contains("learnlm");
+
+    // 1. Models that reject `presencePenalty` / `frequencyPenalty` ("Penalty is not enabled for this model")
+    if is_gemini_3_or_4
+        || is_thinking_model
+        || is_image_model
+        || is_tts_model
+        || is_transcribe_model
+        || is_gemma_or_learnlm
+    {
+        if cfg.remove("presencePenalty").is_some() || cfg.remove("frequencyPenalty").is_some() {
+            log::debug!(
+                "Ignore filter: stripped presencePenalty/frequencyPenalty for model '{model_name}'"
+            );
+        }
+    }
+
+    // 2. Models that reject `responseMimeType` / `responseSchema` ("JSON mode is not enabled for this model")
+    //    and `thinkingConfig` ("Thinking is not enabled for this model")
+    if is_image_model || is_tts_model || is_transcribe_model {
+        if cfg.remove("responseMimeType").is_some() || cfg.remove("responseSchema").is_some() {
+            log::debug!(
+                "Ignore filter: stripped responseMimeType/responseSchema for model '{model_name}'"
+            );
+        }
+        if cfg.remove("thinkingConfig").is_some() {
+            log::debug!("Ignore filter: stripped thinkingConfig for model '{model_name}'");
+        }
+    }
+
+    // 3. TTS models only accept AUDIO modality + speechConfig and reject stopSequences / candidateCount > 1
+    if is_tts_model {
+        cfg.remove("stopSequences");
+        cfg.remove("candidateCount");
+        cfg.remove("topK");
+    }
+}
+
 async fn upload_to_google(
     client: &Client,
     api_key: &str,
@@ -1821,32 +1872,34 @@ pub async fn transform_openai_to_google(
         st.verify_prefix_stability(&contents);
     }
 
-    let temperature = body
-        .get("temperature")
-        .and_then(Value::as_f64)
-        .unwrap_or(1.0);
+    let temperature = body.get("temperature").and_then(Value::as_f64);
     let max_tokens = body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(8192);
-    let top_p = body.get("top_p").and_then(Value::as_f64).unwrap_or(1.0);
+    let top_p = body.get("top_p").and_then(Value::as_f64);
+    // Only extract penalties if explicitly non-zero in the OpenAI request
     let presence_penalty = body
         .get("presence_penalty")
         .and_then(Value::as_f64)
-        .unwrap_or(0.0);
+        .filter(|v| v.abs() > f64::EPSILON);
     let frequency_penalty = body
         .get("frequency_penalty")
         .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let n_candidates = body.get("n").and_then(Value::as_i64).unwrap_or(1);
+        .filter(|v| v.abs() > f64::EPSILON);
+    let n_candidates = body
+        .get("n")
+        .and_then(Value::as_i64)
+        .filter(|&n| n > 1);
     let stop_sequences = match body.get("stop") {
         Some(Value::Array(arr)) => arr
             .iter()
             .filter_map(Value::as_str)
+            .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect::<Vec<String>>(),
-        Some(Value::String(s)) => vec![s.to_string()],
+        Some(Value::String(s)) if !s.is_empty() => vec![s.to_string()],
         _ => Vec::new(),
     };
 
@@ -1868,15 +1921,29 @@ pub async fn transform_openai_to_google(
         })
         .collect();
 
+    // Only populate fields that are actually set instead of sending dummy defaults
     let mut generation_config = json!({
-        "stopSequences": stop_sequences,
-        "candidateCount": n_candidates,
-        "maxOutputTokens": max_tokens,
-        "temperature": temperature,
-        "topP": top_p,
-        "presencePenalty": presence_penalty,
-        "frequencyPenalty": frequency_penalty
+        "maxOutputTokens": max_tokens
     });
+
+    if let Some(temp) = temperature {
+        generation_config["temperature"] = json!(temp);
+    }
+    if let Some(tp) = top_p {
+        generation_config["topP"] = json!(tp);
+    }
+    if !stop_sequences.is_empty() {
+        generation_config["stopSequences"] = json!(stop_sequences);
+    }
+    if let Some(n) = n_candidates {
+        generation_config["candidateCount"] = json!(n);
+    }
+    if let Some(pp) = presence_penalty {
+        generation_config["presencePenalty"] = json!(pp);
+    }
+    if let Some(fp) = frequency_penalty {
+        generation_config["frequencyPenalty"] = json!(fp);
+    }
 
     if let Some(rf) = body.get("response_format") {
         match rf.get("type").and_then(Value::as_str) {
@@ -1939,10 +2006,6 @@ pub async fn transform_openai_to_google(
                 }
             }
         });
-        if let Some(obj) = generation_config.as_object_mut() {
-            obj.remove("presencePenalty");
-            obj.remove("frequencyPenalty");
-        }
     }
 
     if wants_image {
@@ -1966,10 +2029,14 @@ pub async fn transform_openai_to_google(
         }
         generation_config["thinkingConfig"] = tc;
     }
+
+    // Apply the model-capability ignore filter before finalizing generationConfig
+    apply_generation_config_ignore_filter(&mut generation_config, model_name);
+
     log::debug!(
-        "Model: {}, thinkingConfig: {:?}",
+        "Model: {}, final generationConfig: {}",
         model_name,
-        generation_config.get("thinkingConfig")
+        generation_config
     );
 
     let mut result = json!({

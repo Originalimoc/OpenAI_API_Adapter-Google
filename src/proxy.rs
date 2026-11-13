@@ -127,6 +127,60 @@ fn build_thinking_config(
     }
 }
 
+/// Inspects an upstream 400 INVALID_ARGUMENT response body and strips the rejected parameter(s)
+/// from `google_body["generationConfig"]`. Returns `true` if any parameter was removed.
+fn strip_rejected_params_on_400(google_body: &mut Value, err_text: &str) -> bool {
+    let Some(cfg) = google_body
+        .get_mut("generationConfig")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+
+    let mut modified = false;
+
+    if err_text.contains("Penalty is not enabled")
+        || err_text.contains("presencePenalty")
+        || err_text.contains("frequencyPenalty")
+        || err_text.contains("presence_penalty")
+        || err_text.contains("frequency_penalty")
+    {
+        modified |= cfg.remove("presencePenalty").is_some();
+        modified |= cfg.remove("frequencyPenalty").is_some();
+    }
+
+    if err_text.contains("Thinking is not enabled")
+        || err_text.contains("Thinking level is not supported")
+        || err_text.contains("thinking_budget")
+        || err_text.contains("thinking_level")
+        || err_text.contains("thinkingConfig")
+    {
+        modified |= cfg.remove("thinkingConfig").is_some();
+    }
+
+    if err_text.contains("JSON mode is not enabled")
+        || err_text.contains("response_mime_type")
+        || err_text.contains("response_schema")
+        || err_text.contains("responseMimeType")
+    {
+        modified |= cfg.remove("responseMimeType").is_some();
+        modified |= cfg.remove("responseSchema").is_some();
+    }
+
+    if err_text.contains("Stop sequences")
+        || err_text.contains("stop_sequences")
+        || err_text.contains("stopSequences")
+    {
+        modified |= cfg.remove("stopSequences").is_some();
+    }
+
+    if err_text.contains("candidate_count") || err_text.contains("candidateCount") {
+        modified |= cfg.remove("candidateCount").is_some();
+    }
+
+    modified
+}
+
 pub async fn reverse_proxy(
     req: HttpRequest,
     body_data: web::Bytes,
@@ -190,7 +244,7 @@ pub async fn reverse_proxy(
 
     let effective_hide_thoughts = no_thought_process || !data.include_thoughts;
 
-    let google_body = transform_openai_to_google(
+    let mut google_body = transform_openai_to_google(
         &json_body,
         &client,
         &api_key,
@@ -200,11 +254,6 @@ pub async fn reverse_proxy(
     )
     .await;
 
-    let google_body_str = serde_json::to_string(&google_body)
-        .map_err(|_| ErrorInternalServerError("Failed to serialize Google body"))?;
-
-    log::info!("Converted request: {google_body_str}");
-
     let google_base_url = data.upstream_url.clone();
     let google_url = if is_stream {
         format!("{google_base_url}/models/{model_name}:streamGenerateContent?alt=sse&key={api_key}")
@@ -212,92 +261,114 @@ pub async fn reverse_proxy(
         format!("{google_base_url}/models/{model_name}:generateContent?key={api_key}")
     };
 
-    let forward_req = client
-        .post(&google_url)
-        .insert_header(("Content-Type", "application/json"));
-
     log::info!("Forwarding request to: {google_url}");
 
-    match forward_req
-        .timeout(Duration::from_secs(600))
-        .send_body(google_body_str)
-        .await
-    {
-        Ok(mut upstream_response) => {
-            let status: awc::http::StatusCode = upstream_response.status();
+    for attempt in 0..2 {
+        let google_body_str = serde_json::to_string(&google_body)
+            .map_err(|_| ErrorInternalServerError("Failed to serialize Google body"))?;
 
-            if !status.is_success() {
-                let err_body = upstream_response.body().limit(10 * 1024 * 1024).await?;
-                log::error!(
-                    "Upstream error ({}): {}",
-                    status,
-                    String::from_utf8_lossy(&err_body)
-                );
-                return Ok(HttpResponse::build(status)
-                    .content_type("application/json")
-                    .body(err_body));
-            }
+        log::info!("Converted request (attempt {}): {google_body_str}", attempt + 1);
 
-            if upstream_response.content_type().contains("text/event-stream") {
-                let state_clone = data.get_ref().clone();
-                let md_thought = data.markdown_thought;
-                let requested_model = model_name_in_request.to_string();
+        let forward_req = client
+            .post(&google_url)
+            .insert_header(("Content-Type", "application/json"));
 
-                let up_stream = async_stream_from_upstream(
-                    upstream_response,
-                    requested_model,
-                    effective_hide_thoughts,
-                    md_thought,
-                    state_clone,
-                );
+        match forward_req
+            .timeout(Duration::from_secs(600))
+            .send_body(google_body_str)
+            .await
+        {
+            Ok(mut upstream_response) => {
+                let status: awc::http::StatusCode = upstream_response.status();
 
-                Ok(HttpResponse::build(status)
-                    .insert_header(("Content-Type", "text/event-stream; charset=utf-8"))
-                    .insert_header(("Cache-Control", "no-cache"))
-                    .insert_header(("Connection", "keep-alive"))
-                    .insert_header(("X-Accel-Buffering", "no"))
-                    .streaming(up_stream))
-            } else {
-                let mut response = HttpResponse::build(status);
-                for (name, value) in upstream_response.headers().iter() {
-                    let lower = name.as_str().to_ascii_lowercase();
-                    if !lower.contains("content-encoding")
-                        && !lower.contains("content-length")
-                        && !lower.contains("transfer-encoding")
+                if !status.is_success() {
+                    let err_body = upstream_response.body().limit(10 * 1024 * 1024).await?;
+                    let err_text = String::from_utf8_lossy(&err_body);
+
+                    // If 400 Bad Request is caused by an unsupported parameter on this model,
+                    // strip the rejected parameter from `generationConfig` and retry once.
+                    if status == awc::http::StatusCode::BAD_REQUEST
+                        && attempt == 0
+                        && strip_rejected_params_on_400(&mut google_body, &err_text)
                     {
-                        response.insert_header((name.clone(), value.clone()));
+                        log::warn!(
+                            "Upstream 400 due to unsupported parameter on '{model_name}'; stripped offending field and retrying: {err_text}"
+                        );
+                        continue;
+                    }
+
+                    log::error!("Upstream error ({}): {}", status, err_text);
+                    return Ok(HttpResponse::build(status)
+                        .content_type("application/json")
+                        .body(err_body));
+                }
+
+                if upstream_response.content_type().contains("text/event-stream") {
+                    let state_clone = data.get_ref().clone();
+                    let md_thought = data.markdown_thought;
+                    let requested_model = model_name_in_request.to_string();
+
+                    let up_stream = async_stream_from_upstream(
+                        upstream_response,
+                        requested_model,
+                        effective_hide_thoughts,
+                        md_thought,
+                        state_clone,
+                    );
+
+                    return Ok(HttpResponse::build(status)
+                        .insert_header(("Content-Type", "text/event-stream; charset=utf-8"))
+                        .insert_header(("Cache-Control", "no-cache"))
+                        .insert_header(("Connection", "keep-alive"))
+                        .insert_header(("X-Accel-Buffering", "no"))
+                        .streaming(up_stream));
+                } else {
+                    let mut response = HttpResponse::build(status);
+                    for (name, value) in upstream_response.headers().iter() {
+                        let lower = name.as_str().to_ascii_lowercase();
+                        if !lower.contains("content-encoding")
+                            && !lower.contains("content-length")
+                            && !lower.contains("transfer-encoding")
+                        {
+                            response.insert_header((name.clone(), value.clone()));
+                        }
+                    }
+
+                    let body = upstream_response.body().limit(100 * 1024 * 1024).await?;
+                    log::info!("Got reply from Google: {}", String::from_utf8_lossy(&body));
+
+                    let google_response: Value = serde_json::from_slice(&body)
+                        .map_err(|_| ErrorInternalServerError("Failed to parse Google response"))?;
+
+                    let (openai_response, _) = transform_google_to_openai(
+                        &google_response,
+                        false,
+                        effective_hide_thoughts,
+                        false,
+                        data.markdown_thought,
+                        Some(data.get_ref()),
+                    );
+                    if let Some(openai_response) = openai_response {
+                        log::info!("Replied to client: {openai_response}");
+                        return Ok(response.json(openai_response));
+                    } else {
+                        log::error!(
+                            "Non stream mode but no choices available. Replied 503 to client"
+                        );
+                        return Ok(HttpResponse::ServiceUnavailable()
+                            .body("No choices returned from upstream server."));
                     }
                 }
-
-                let body = upstream_response.body().limit(100 * 1024 * 1024).await?;
-                log::info!("Got reply from Google: {}", String::from_utf8_lossy(&body));
-
-                let google_response: Value = serde_json::from_slice(&body)
-                    .map_err(|_| ErrorInternalServerError("Failed to parse Google response"))?;
-
-                let (openai_response, _) = transform_google_to_openai(
-                    &google_response,
-                    false,
-                    effective_hide_thoughts,
-                    false,
-                    data.markdown_thought,
-                    Some(data.get_ref()),
-                );
-                if let Some(openai_response) = openai_response {
-                    log::info!("Replied to client: {openai_response}");
-                    Ok(response.json(openai_response))
-                } else {
-                    log::error!("Non stream mode but no choices available. Replied 503 to client");
-                    Ok(HttpResponse::ServiceUnavailable()
-                        .body("No choices returned from upstream server."))
-                }
+            }
+            Err(err) => {
+                log::error!("Failed to forward request: {err:?}");
+                return Ok(HttpResponse::InternalServerError()
+                    .body("Failed to connect to upstream server."));
             }
         }
-        Err(err) => {
-            log::error!("Failed to forward request: {err:?}");
-            Ok(HttpResponse::InternalServerError().body("Failed to connect to upstream server."))
-        }
     }
+
+    Ok(HttpResponse::InternalServerError().body("Exhausted upstream retry attempts."))
 }
 
 /// Extracts the next complete SSE event block from a raw byte buffer (`\n\n` or `\r\n\r\n`)
