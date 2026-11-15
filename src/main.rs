@@ -22,6 +22,7 @@ async fn main() -> std::io::Result<()> {
         args.markdown_thought,
         args.include_thoughts,
         args.default_reasoning_effort,
+        args.upload_media,
         args.port,
         args.cache_id,
     );

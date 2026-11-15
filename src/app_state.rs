@@ -48,6 +48,7 @@ pub struct AppState {
     pub markdown_thought: bool,
     pub include_thoughts: bool,
     pub default_reasoning_effort: String,
+    pub upload_media: bool,
     pub store: Arc<Mutex<CacheStore>>,
     pub own_cache_path: PathBuf,
     pub cache_dir: PathBuf,
@@ -102,11 +103,12 @@ fn merge_text_meta(existing: &mut TextTurnMeta, incoming: TextTurnMeta) {
 }
 
 impl AppState {
-    pub fn new(
+pub fn new(
         upstream_url: String,
         markdown_thought: bool,
         include_thoughts: bool,
         default_reasoning_effort: String,
+        upload_media: bool,
         port: u16,
         cache_id: Option<String>,
     ) -> Self {
@@ -129,11 +131,12 @@ impl AppState {
         let own_cache_path = cache_dir.join(format!("{CACHE_FILE_PREFIX}_{instance_tag}.json"));
 
         log::info!(
-            "Cache initialized: writing to {:?}, reading all {:?}/{CACHE_FILE_PREFIX}*.json (include_thoughts={}, default_reasoning_effort={})",
+            "Cache initialized: writing to {:?}, reading all {:?}/{CACHE_FILE_PREFIX}*.json (include_thoughts={}, default_reasoning_effort={}, upload_media={})",
             own_cache_path,
             cache_dir,
             include_thoughts,
-            default_reasoning_effort
+            default_reasoning_effort,
+            upload_media
         );
 
         let state = Self {
@@ -141,6 +144,7 @@ impl AppState {
             markdown_thought,
             include_thoughts,
             default_reasoning_effort,
+            upload_media,
             store: Arc::new(Mutex::new(CacheStore::default())),
             own_cache_path,
             cache_dir,
@@ -148,7 +152,7 @@ impl AppState {
         state.sync_all_from_disk();
         state
     }
-
+    
     /// Scans `cache_dir` for all `.gemini_adapter_cache*.json` files and merges any new or modified files.
     pub fn sync_all_from_disk(&self) {
         let mut s = match self.store.lock() {

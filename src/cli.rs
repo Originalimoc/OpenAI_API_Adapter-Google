@@ -28,4 +28,13 @@ pub struct Args {
     /// Values: high (default), medium, low, minimal, none, dynamic
     #[arg(long, value_name = "effort", default_value = "high")]
     pub default_reasoning_effort: String,
+    /// Upload media to `/upload/v1beta/files` and send `fileData` pointers instead of `inlineData`.
+    /// Defaults to `false` (`inlineData` mode) for maximum relay compatibility and prefix cache stability.
+    #[arg(
+        long,
+        value_name = "bool",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    pub upload_media: bool,
 }

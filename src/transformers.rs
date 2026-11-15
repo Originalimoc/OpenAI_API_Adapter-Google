@@ -106,6 +106,377 @@ fn decode_base64_and_get_mime_type(encoded_data: &str) -> Result<(String, Vec<u8
     Ok((mime_type, decoded_data))
 }
 
+/// Sniffs common image, audio, video, and document MIME types from decoded magic bytes.
+fn sniff_mime_type(bytes: &[u8], fallback: &str) -> String {
+    if bytes.len() >= 12 {
+        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return "image/png".to_string();
+        }
+        if bytes.starts_with(b"\xff\xd8\xff") {
+            return "image/jpeg".to_string();
+        }
+        if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            return "image/gif".to_string();
+        }
+        if bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+            return "image/webp".to_string();
+        }
+        if bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+            return "audio/wav".to_string();
+        }
+        if bytes.starts_with(b"OggS") {
+            return "audio/ogg".to_string();
+        }
+        if bytes.starts_with(b"fLaC") {
+            return "audio/flac".to_string();
+        }
+        if bytes.starts_with(b"ID3") || (bytes[0] == 0xff && (bytes[1] & 0xe0) == 0xe0) {
+            return "audio/mp3".to_string();
+        }
+        if &bytes[4..8] == b"ftyp" {
+            return "video/mp4".to_string();
+        }
+        if bytes.starts_with(b"%PDF") {
+            return "application/pdf".to_string();
+        }
+    }
+    fallback.to_string()
+}
+
+/// Parses a `data:<mime>[;param=val];base64,<data>` URI or raw base64 string into `(mime_type, clean_base64, raw_bytes)`.
+fn parse_base64_media(input: &str, default_mime: &str) -> Result<(String, String, Vec<u8>), Error> {
+    let trimmed = input.trim();
+
+    let (declared_mime, raw_b64) = if let Some(rest) = trimmed.strip_prefix("data:") {
+        let comma_pos = rest
+            .find(',')
+            .ok_or_else(|| ErrorBadRequest("Invalid data URI format"))?;
+        let metadata = &rest[..comma_pos];
+        let b64_part = &rest[comma_pos + 1..];
+
+        let mut meta_parts = metadata.split(';').filter(|s| !s.is_empty());
+        let mime = meta_parts
+            .next()
+            .filter(|m| m.contains('/'))
+            .unwrap_or(default_mime);
+
+        let is_b64 = metadata
+            .split(';')
+            .any(|seg| seg.trim().eq_ignore_ascii_case("base64"));
+        if !is_b64 {
+            return Err(ErrorBadRequest("Unsupported data URI encoding (expected base64)"));
+        }
+        (mime.to_string(), b64_part)
+    } else {
+        (default_mime.to_string(), trimmed)
+    };
+
+    let clean_b64: String = raw_b64.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let decoded = STANDARD
+        .decode(&clean_b64)
+        .map_err(|_| ErrorBadRequest("Failed to decode Base64 media"))?;
+
+    let final_mime = if declared_mime == "application/octet-stream" || declared_mime.is_empty() {
+        sniff_mime_type(&decoded, default_mime)
+    } else {
+        declared_mime
+    };
+
+    Ok((final_mime, clean_b64, decoded))
+}
+
+/// Builds the `/upload/v1beta/files` endpoint from the configured `upstream_url`
+fn build_upload_url(upstream_url: &str, api_key: &str) -> String {
+    let base = upstream_url.trim_end_matches('/');
+    let root = base.strip_suffix("/v1beta").unwrap_or(base);
+    format!("{root}/upload/v1beta/files?key={api_key}")
+}
+
+async fn upload_to_google(
+    client: &Client,
+    upstream_url: &str,
+    api_key: &str,
+    metadata: Value,
+    file_data: Vec<u8>,
+    mime_type: &str,
+) -> Result<String, Error> {
+    let upload_url = build_upload_url(upstream_url, api_key);
+
+    let meta_response = client
+        .post(&upload_url)
+        .insert_header(("X-Goog-Upload-Protocol", "resumable"))
+        .insert_header(("X-Goog-Upload-Command", "start"))
+        .insert_header((
+            "X-Goog-Upload-Header-Content-Length",
+            file_data.len().to_string(),
+        ))
+        .insert_header(("X-Goog-Upload-Header-Content-Type", mime_type))
+        .insert_header(("Content-Type", "application/json"))
+        .send_body(metadata.to_string())
+        .await
+        .map_err(|_| ErrorInternalServerError("Failed to initiate upload"))?;
+
+    if !meta_response.status().is_success() {
+        return Err(ErrorInternalServerError(
+            "Upstream relay does not support /upload/v1beta/files",
+        ));
+    }
+
+    let resumable_url = meta_response
+        .headers()
+        .get("X-Goog-Upload-URL")
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| ErrorInternalServerError("Missing X-Goog-Upload-URL header"))?;
+
+    let response = client
+        .post(resumable_url)
+        .insert_header(("Content-Length", file_data.len().to_string()))
+        .insert_header(("X-Goog-Upload-Offset", "0"))
+        .insert_header(("X-Goog-Upload-Command", "upload, finalize"))
+        .send_body(file_data)
+        .await
+        .map_err(|_| ErrorInternalServerError("Failed to upload file bytes"))?
+        .json::<Value>()
+        .await
+        .map_err(|_| ErrorInternalServerError("Failed to parse upload JSON response"))?;
+
+    let file_uri = response["file"]["uri"]
+        .as_str()
+        .ok_or_else(|| ErrorInternalServerError("File URI not returned"))?;
+    Ok(file_uri.to_string())
+}
+
+/// Resolves any media reference (`data:...;base64,...`, raw base64, `files/...` pointer, or `http(s)://` URL)
+/// into a deterministic Gemini `Part` (`inlineData` by default, or `fileData` pointer if already a pointer or `--upload-media` is enabled).
+pub async fn resolve_media_part(
+    client: &Client,
+    api_key: &str,
+    media_input: &str,
+    default_mime: &str,
+    app_state: Option<&AppState>,
+) -> Option<Value> {
+    let trimmed = media_input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // 1. If the input is already a Google File API URI pointer (`files/...`, `gs://...`, or `.../v1beta/files/...`),
+    //    pass the pointer through directly without re-uploading.
+    if trimmed.starts_with("files/")
+        || trimmed.starts_with("gs://")
+        || trimmed.contains("/v1beta/files/")
+    {
+        let full_uri = if trimmed.starts_with("files/") {
+            let base = app_state
+                .map(|s| s.upstream_url.trim_end_matches('/'))
+                .unwrap_or("https://generativelanguage.googleapis.com/v1beta");
+            format!("{base}/{trimmed}")
+        } else {
+            trimmed.to_string()
+        };
+        return Some(json!({
+            "fileData": {
+                "fileUri": full_uri,
+                "mimeType": default_mime
+            }
+        }));
+    }
+
+    // 2. If the input is an external HTTP(S) URL, download once and cache its base64 in AppState
+    //    so subsequent turns never re-download or risk changing bytes.
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let cache_key = format!("url:{trimmed}");
+        if let Some(st) = app_state {
+            if let Some((cached_mime, cached_val)) = st.get_cached_file(&cache_key) {
+                if let Some(b64) = cached_val.strip_prefix("inline:") {
+                    return Some(json!({
+                        "inlineData": {
+                            "data": b64,
+                            "mimeType": cached_mime
+                        }
+                    }));
+                } else {
+                    return Some(json!({
+                        "fileData": {
+                            "fileUri": cached_val,
+                            "mimeType": cached_mime
+                        }
+                    }));
+                }
+            }
+        }
+
+        match client
+            .get(trimmed)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+        {
+            Ok(mut resp) if resp.status().is_success() => {
+                let header_mime = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.split(';').next())
+                    .unwrap_or(default_mime)
+                    .to_string();
+                if let Ok(bytes) = resp.body().limit(50 * 1024 * 1024).await {
+                    let mime = sniff_mime_type(&bytes, &header_mime);
+                    let b64 = STANDARD.encode(&bytes);
+                    if let Some(st) = app_state {
+                        st.record_cached_file(&cache_key, mime.clone(), format!("inline:{b64}"));
+                    }
+                    return Some(json!({
+                        "inlineData": {
+                            "data": b64,
+                            "mimeType": mime
+                        }
+                    }));
+                }
+            }
+            Ok(resp) => log::error!("Failed downloading media URL {trimmed}: HTTP {}", resp.status()),
+            Err(e) => log::error!("Error downloading media URL {trimmed}: {e}"),
+        }
+        return None;
+    }
+
+    // 3. Parse Data URI or raw Base64
+    let (mime_type, clean_b64, raw_bytes) = match parse_base64_media(trimmed, default_mime) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            log::error!("Failed to parse media input: {e}");
+            return None;
+        }
+    };
+
+    // Check if this exact media was already uploaded to a pointer in an earlier turn;
+    // if so, keep using that pointer (or cached inline fallback) so the prefix cache never flips!
+    if let Some(st) = app_state {
+        if let Some((cached_mime, cached_uri)) = st.get_cached_file(&clean_b64) {
+            if let Some(b64) = cached_uri.strip_prefix("inline:") {
+                return Some(json!({
+                    "inlineData": {
+                        "data": b64,
+                        "mimeType": cached_mime
+                    }
+                }));
+            } else {
+                return Some(json!({
+                    "fileData": {
+                        "fileUri": cached_uri,
+                        "mimeType": cached_mime
+                    }
+                }));
+            }
+        }
+    }
+
+    let should_upload = app_state.map(|s| s.upload_media).unwrap_or(false);
+    if should_upload {
+        let upstream_url = app_state
+            .map(|s| s.upstream_url.as_str())
+            .unwrap_or("https://generativelanguage.googleapis.com/v1beta");
+        let metadata = json!({"file": {"display_name": "uploaded_media"}});
+
+        match upload_to_google(client, upstream_url, api_key, metadata, raw_bytes, &mime_type).await
+        {
+            Ok(uploaded_uri) => {
+                log::info!("Media uploaded to pointer URI: {uploaded_uri}");
+                if let Some(st) = app_state {
+                    st.record_cached_file(&clean_b64, mime_type.clone(), uploaded_uri.clone());
+                }
+                return Some(json!({
+                    "fileData": {
+                        "fileUri": uploaded_uri,
+                        "mimeType": mime_type
+                    }
+                }));
+            }
+            Err(e) => {
+                log::warn!(
+                    "Upload to /upload/v1beta/files unsupported or failed ({e}); falling back to inlineData"
+                );
+                if let Some(st) = app_state {
+                    // Cache the inline fallback so subsequent turns never retry uploading or flip formats
+                    st.record_cached_file(
+                        &clean_b64,
+                        mime_type.clone(),
+                        format!("inline:{clean_b64}"),
+                    );
+                }
+            }
+        }
+    }
+
+    // Default: canonical `inlineData` (works on all relays + official Google API, 100% cache-stable)
+    Some(json!({
+        "inlineData": {
+            "data": clean_b64,
+            "mimeType": mime_type
+        }
+    }))
+}
+
+/// Splits text containing markdown `![...](data:<mime>;base64,<data>)` into ordered `text` and `inlineData` parts
+/// so assistant-generated images echoed in conversation history are restored as native `inlineData` parts.
+fn split_text_and_markdown_media(text: &str, convert_to_inline_parts: bool) -> Vec<Value> {
+    if !convert_to_inline_parts || !text.contains("](data:") {
+        return if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({ "text": text })]
+        };
+    }
+
+    let mut parts = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(rel_start) = text[cursor..].find("![") {
+        let img_start = cursor + rel_start;
+        let after_bang = img_start + 2;
+
+        let Some(rel_mid) = text[after_bang..].find("](data:") else {
+            cursor = after_bang;
+            continue;
+        };
+        let data_uri_start = after_bang + rel_mid + 2; // points at "data:"
+
+        let Some(rel_end) = text[data_uri_start..].find(')') else {
+            break;
+        };
+        let data_uri_end = data_uri_start + rel_end;
+        let data_uri = &text[data_uri_start..data_uri_end];
+
+        if let Ok((mime, clean_b64, _)) = parse_base64_media(data_uri, "image/png") {
+            let before_text = &text[cursor..img_start];
+            let trimmed_before = before_text.trim_matches('\n');
+            if !trimmed_before.is_empty() {
+                parts.push(json!({ "text": trimmed_before }));
+            }
+            parts.push(json!({
+                "inlineData": {
+                    "data": clean_b64,
+                    "mimeType": mime
+                }
+            }));
+            cursor = data_uri_end + 1;
+        } else {
+            cursor = data_uri_end + 1;
+        }
+    }
+
+    let tail = text[cursor..].trim_matches('\n');
+    if !tail.is_empty() {
+        parts.push(json!({ "text": tail }));
+    }
+
+    if parts.is_empty() && !text.is_empty() {
+        vec![json!({ "text": text })]
+    } else {
+        parts
+    }
+}
+
 /// Proactively strips unsupported `generationConfig` fields for models that reject them with 400 INVALID_ARGUMENT.
 pub fn apply_generation_config_ignore_filter(generation_config: &mut Value, model_name: &str) {
     let Some(cfg) = generation_config.as_object_mut() else {
@@ -155,96 +526,6 @@ pub fn apply_generation_config_ignore_filter(generation_config: &mut Value, mode
         cfg.remove("candidateCount");
         cfg.remove("topK");
     }
-}
-
-async fn upload_to_google(
-    client: &Client,
-    api_key: &str,
-    metadata: Value,
-    file_data: Vec<u8>,
-    mime_type: &str,
-) -> Result<String, Error> {
-    let upload_url =
-        format!("https://generativelanguage.googleapis.com/upload/v1beta/files?key={api_key}");
-
-    let meta_response = client
-        .post(&upload_url)
-        .insert_header(("X-Goog-Upload-Protocol", "resumable"))
-        .insert_header(("X-Goog-Upload-Command", "start"))
-        .insert_header((
-            "X-Goog-Upload-Header-Content-Length",
-            file_data.len().to_string(),
-        ))
-        .insert_header(("X-Goog-Upload-Header-Content-Type", mime_type))
-        .insert_header(("Content-Type", "application/json"))
-        .send_body(metadata.to_string())
-        .await
-        .map_err(|_| ErrorInternalServerError("Failed to initiate upload"))?;
-
-    let upload_url = meta_response
-        .headers()
-        .get("X-Goog-Upload-URL")
-        .and_then(|h| h.to_str().ok())
-        .ok_or(ErrorInternalServerError("Failed to get upload URL"))?;
-
-    let response = client
-        .post(upload_url)
-        .insert_header(("Content-Length", file_data.len().to_string()))
-        .insert_header(("X-Goog-Upload-Offset", "0"))
-        .insert_header(("X-Goog-Upload-Command", "upload, finalize"))
-        .send_body(file_data)
-        .await
-        .map_err(|_| ErrorInternalServerError("Failed to upload file"))?
-        .json::<Value>()
-        .await
-        .map_err(|_| ErrorInternalServerError("Failed to parse JSON response"))?;
-
-    let file_uri = response["file"]["uri"]
-        .as_str()
-        .ok_or(ErrorInternalServerError("File URI not returned"))?;
-    Ok(file_uri.to_string())
-}
-
-pub async fn upload_base64_image_to_google(
-    client: &Client,
-    api_key: &str,
-    base64_data: &str,
-    app_state: Option<&AppState>,
-) -> Result<(String, String), Error> {
-    if let Some(st) = app_state {
-        if let Some(cached) = st.get_cached_file(base64_data) {
-            log::debug!("Reusing cached image file_uri: {}", cached.1);
-            return Ok(cached);
-        }
-    }
-    let (mime_type, image_data) = decode_base64_and_get_mime_type(base64_data)?;
-    let metadata = json!({"file": {"display_name": "uploaded_image"}});
-    let uri = upload_to_google(client, api_key, metadata, image_data, &mime_type).await?;
-    if let Some(st) = app_state {
-        st.record_cached_file(base64_data, mime_type.clone(), uri.clone());
-    }
-    Ok((mime_type, uri))
-}
-
-pub async fn upload_base64_audio_to_google(
-    client: &Client,
-    api_key: &str,
-    base64_data: &str,
-    app_state: Option<&AppState>,
-) -> Result<(String, String), Error> {
-    if let Some(st) = app_state {
-        if let Some(cached) = st.get_cached_file(base64_data) {
-            log::debug!("Reusing cached audio file_uri: {}", cached.1);
-            return Ok(cached);
-        }
-    }
-    let (mime_type, audio_data) = decode_base64_and_get_mime_type(base64_data)?;
-    let metadata = json!({"file": {"display_name": "uploaded_audio"}});
-    let uri = upload_to_google(client, api_key, metadata, audio_data, &mime_type).await?;
-    if let Some(st) = app_state {
-        st.record_cached_file(base64_data, mime_type.clone(), uri.clone());
-    }
-    Ok((mime_type, uri))
 }
 
 pub fn map_openai_voice(voice: &str) -> &str {
@@ -1648,10 +1929,10 @@ pub async fn transform_openai_to_google(
                     }
                     if !clean_ans.is_empty() {
                         answer_text_accumulator.push_str(&clean_ans);
-                        parts_vec.push(json!({ "text": clean_ans }));
+                        parts_vec.extend(split_text_and_markdown_media(&clean_ans, true));
                     }
                 } else if !text.is_empty() {
-                    parts_vec.push(json!({ "text": text }));
+                    parts_vec.extend(split_text_and_markdown_media(text, true));
                 }
             }
             Value::Array(content_parts) => {
@@ -1666,67 +1947,143 @@ pub async fn transform_openai_to_google(
                                     }
                                     if !clean_ans.is_empty() {
                                         answer_text_accumulator.push_str(&clean_ans);
-                                        parts_vec.push(json!({ "text": clean_ans }));
+                                        parts_vec.extend(split_text_and_markdown_media(
+                                            &clean_ans,
+                                            true,
+                                        ));
                                     }
                                 } else if !text.is_empty() {
-                                    parts_vec.push(json!({ "text": text }));
+                                    parts_vec.extend(split_text_and_markdown_media(text, true));
                                 }
                             }
                         }
                         Some("image_url") => {
-                            if let Some(image_url) = part.get("image_url") {
-                                let url_or_b64 = image_url["url"].as_str().unwrap_or("");
-                                if url_or_b64.starts_with("data:") {
-                                    match upload_base64_image_to_google(
-                                        client,
-                                        api_key,
-                                        url_or_b64,
-                                        app_state,
-                                    )
-                                    .await
-                                    {
-                                        Ok((mime, uploaded_uri)) => {
-                                            parts_vec.push(json!({
-                                                "file_data": {
-                                                    "mime_type": mime,
-                                                    "file_uri": uploaded_uri
-                                                }
-                                            }));
-                                        }
-                                        Err(e) => log::error!("Error uploading image: {e}"),
-                                    }
-                                }
+                            let url_or_b64 = part
+                                .pointer("/image_url/url")
+                                .or_else(|| part.get("image_url"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if let Some(media_part) = resolve_media_part(
+                                client,
+                                api_key,
+                                url_or_b64,
+                                "image/jpeg",
+                                app_state,
+                            )
+                            .await
+                            {
+                                parts_vec.push(media_part);
                             }
                         }
                         Some("input_audio") => {
                             if let Some(audio) = part.get("input_audio") {
                                 let raw_data = audio["data"].as_str().unwrap_or("");
                                 let fmt = audio["format"].as_str().unwrap_or("wav");
-                                let data_uri = if raw_data.starts_with("data:") {
+                                let default_mime = match fmt.to_ascii_lowercase().as_str() {
+                                    "mp3" | "mpeg" => "audio/mp3",
+                                    "ogg" | "opus" => "audio/ogg",
+                                    "flac" => "audio/flac",
+                                    "aac" => "audio/aac",
+                                    "pcm" | "pcm16" | "l16" => "audio/L16;codec=pcm;rate=24000",
+                                    _ => "audio/wav",
+                                };
+                                let data_uri = if raw_data.starts_with("data:")
+                                    || raw_data.starts_with("http://")
+                                    || raw_data.starts_with("https://")
+                                    || raw_data.starts_with("files/")
+                                {
                                     raw_data.to_string()
                                 } else {
-                                    format!("data:audio/{fmt};base64,{raw_data}")
+                                    format!("data:{default_mime};base64,{raw_data}")
                                 };
-                                if let Ok((mime, uploaded_uri)) = upload_base64_audio_to_google(
+                                if let Some(media_part) = resolve_media_part(
                                     client,
                                     api_key,
                                     &data_uri,
+                                    default_mime,
                                     app_state,
                                 )
                                 .await
                                 {
-                                    parts_vec.push(json!({
-                                        "file_data": {
-                                            "mime_type": mime,
-                                            "file_uri": uploaded_uri
-                                        }
-                                    }));
-                                } else {
-                                    log::error!("Error uploading audio");
+                                    parts_vec.push(media_part);
                                 }
                             }
                         }
-                        _ => log::warn!("Unknown content part type in message"),
+                        Some("video_url") | Some("video") => {
+                            let url_or_b64 = part
+                                .pointer("/video_url/url")
+                                .or_else(|| part.get("video_url"))
+                                .or_else(|| part.pointer("/video/url"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if let Some(media_part) = resolve_media_part(
+                                client,
+                                api_key,
+                                url_or_b64,
+                                "video/mp4",
+                                app_state,
+                            )
+                            .await
+                            {
+                                parts_vec.push(media_part);
+                            }
+                        }
+                        Some("audio_url") => {
+                            let url_or_b64 = part
+                                .pointer("/audio_url/url")
+                                .or_else(|| part.get("audio_url"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if let Some(media_part) = resolve_media_part(
+                                client,
+                                api_key,
+                                url_or_b64,
+                                "audio/wav",
+                                app_state,
+                            )
+                            .await
+                            {
+                                parts_vec.push(media_part);
+                            }
+                        }
+                        Some("file") | Some("input_file") => {
+                            let file_obj = part
+                                .get("file")
+                                .or_else(|| part.get("input_file"))
+                                .unwrap_or(part);
+                            let data_or_url = file_obj
+                                .get("file_data")
+                                .or_else(|| file_obj.get("file_url"))
+                                .or_else(|| file_obj.get("url"))
+                                .or_else(|| file_obj.get("data"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let mime = file_obj
+                                .get("mime_type")
+                                .or_else(|| file_obj.get("mimeType"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("application/pdf");
+                            if let Some(media_part) =
+                                resolve_media_part(client, api_key, data_or_url, mime, app_state)
+                                    .await
+                            {
+                                parts_vec.push(media_part);
+                            }
+                        }
+                        _ => {
+                            // Pass through raw Gemini `inlineData` or `fileData` if already present
+                            if let Some(inline) =
+                                part.get("inlineData").or_else(|| part.get("inline_data"))
+                            {
+                                parts_vec.push(json!({ "inlineData": canonicalize_json(inline) }));
+                            } else if let Some(fd) =
+                                part.get("fileData").or_else(|| part.get("file_data"))
+                            {
+                                parts_vec.push(json!({ "fileData": canonicalize_json(fd) }));
+                            } else {
+                                log::warn!("Unknown content part type in message: {part}");
+                            }
+                        }
                     }
                 }
             }
